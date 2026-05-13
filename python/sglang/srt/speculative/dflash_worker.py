@@ -21,6 +21,10 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
+from sglang.srt.speculative.dflash_tree_builder import (
+    build_best_first_trees_batched,
+    build_tree_mask_dense,
+)
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     is_dflash_sampling_verify_available,
@@ -230,6 +234,44 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+        self.best_first_verify_length: Optional[int] = None
+        if server_args.speculative_dflash_best_first_tokens is not None:
+            self.best_first_verify_length = int(
+                server_args.speculative_dflash_best_first_tokens
+            )
+            if int(server_args.tp_size) > 1:
+                raise NotImplementedError(
+                    "DFLASH best_first does not yet support tp_size > 1 "
+                    "(top-k over the LM head is not TP-fused yet)."
+                )
+
+            # Verify backends size their metadata from a draft-token count
+            # captured at init (= block_size). With a tree we need tree_size
+            # instead. Triton stores it as `num_draft_tokens`; FA3/FA4 as
+            # `speculative_num_draft_tokens` — override whichever exists.
+            _draft_token_attrs = ("num_draft_tokens", "speculative_num_draft_tokens")
+            target_attn = getattr(self.model_runner, "attn_backend", None)
+            if target_attn is not None:
+                for attr in _draft_token_attrs:
+                    if hasattr(target_attn, attr):
+                        setattr(target_attn, attr, self.best_first_verify_length)
+            for name in ("prefill_attn_backend", "decode_attn_backend"):
+                backend = getattr(self.model_runner, name, None)
+                if backend is not None:
+                    for attr in _draft_token_attrs:
+                        if hasattr(backend, attr):
+                            setattr(backend, attr, self.best_first_verify_length)
+
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH best_first tree mode enabled: verify_length=%d, "
+                    "max_depth=%d (= block_size - 1). Overrode target "
+                    "attention backend num_draft_tokens to %d.",
+                    self.best_first_verify_length,
+                    self.block_size - 1,
+                    self.best_first_verify_length,
+                )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -676,14 +718,76 @@ class DFlashWorker:
         draft_tokens[:, 1:].copy_(draft_next)
         positions = positions_2d.reshape(-1)
 
-        verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
-        )
+        if self.best_first_verify_length is not None:
+            verify_length = int(self.best_first_verify_length)
+            # Per-depth top-k draft sampling (TP=1; tp_size > 1 was rejected in __init__).
+            # hidden_states for draft are at depths 1..block_size-1.
+            draft_hidden_2d = draft_hidden[:, 1:, :].reshape(
+                -1, draft_hidden.shape[-1]
+            )  # [bs * (block_size - 1), hidden]
+            sorted_lp_flat, sorted_ids_flat = self._topk_logprobs_from_vocab_parallel_head(
+                hidden_states=draft_hidden_2d,
+                lm_head=lm_head,
+                k=verify_length,
+            )
+            # Reshape to [bs, block_size - 1, k].
+            depth = int(self.block_size - 1)
+            k_eff = int(sorted_lp_flat.shape[-1])
+            sorted_logprobs = sorted_lp_flat.view(bs, depth, k_eff)
+            sorted_token_ids = sorted_ids_flat.view(bs, depth, k_eff)
+            bonus_tokens = draft_input.bonus_tokens.to(torch.int64)
+            trees = build_best_first_trees_batched(
+                bonus_tokens=bonus_tokens,
+                sorted_logprobs=sorted_logprobs,
+                sorted_token_ids=sorted_token_ids,
+                verify_length=verify_length,
+            )
+
+            # Stack per-request tensors. All trees have tree_size == verify_length.
+            tokens_b = torch.stack([t.tokens for t in trees]).to(self.device)
+            parents_b = torch.stack([t.parent_indices for t in trees]).to(self.device)
+            depths_b = torch.stack([t.depths for t in trees]).to(self.device)
+            first_child_b = torch.stack([t.first_child for t in trees]).to(self.device)
+            next_sibling_b = torch.stack([t.next_sibling for t in trees]).to(self.device)
+            tree_mask_dense_b = torch.stack(
+                [build_tree_mask_dense(t.parent_indices.tolist()) for t in trees]
+            ).to(self.device)
+
+            retrieve_index_bf = torch.arange(
+                bs * verify_length, dtype=torch.int64, device=self.device
+            ).view(bs, verify_length)
+            tree_positions_bf = (
+                target_prefix_lens.to(torch.int64).unsqueeze(1) + depths_b
+            ).reshape(-1)
+
+            verify_input = DFlashVerifyInput(
+                draft_token=tokens_b.reshape(-1),
+                positions=tree_positions_bf,
+                draft_token_num=verify_length,
+                topk=verify_length,
+                retrieve_index=retrieve_index_bf,
+                retrieve_next_token=first_child_b,
+                retrieve_next_sibling=next_sibling_b,
+                parent_indices=parents_b[0],
+                depths=depths_b[0],
+                tree_mode=True,
+                tree_mask_dense=tree_mask_dense_b,
+            )
+        else:
+            verify_input = DFlashVerifyInput(
+                draft_token=draft_tokens.reshape(-1),
+                positions=positions,
+                draft_token_num=self.block_size,
+            )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
         )
+        # Tree-mode verify always needs the dense custom_mask: the attention
+        # backend (triton or FA) consumes it to encode ancestor-only access.
+        # The skip list applies only to chain-mode verify, where the implicit
+        # causal mask within the draft block is already correct.
+        if getattr(verify_input, "tree_mode", False):
+            build_custom_mask = True
         verify_input.prepare_for_verify(
             batch,
             self.page_size,
@@ -697,6 +801,60 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+
+    def _topk_logprobs_from_vocab_parallel_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,  # [N, hidden]
+        lm_head,
+        k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-k log-probs and token ids over the LM head. TP=1, no added vocab.
+
+        Returns (sorted_logprobs [N, k] float32, sorted_token_ids [N, k] int64).
+        The `__init__` path rejects tp_size > 1 in best_first mode, so this
+        helper is intentionally simple (no TP gather, no chunking — N is at most
+        `bs * (block_size - 1)` which fits a single matmul).
+        """
+        if hidden_states.numel() == 0:
+            empty_lp = torch.empty(
+                (0, k), dtype=torch.float32, device=hidden_states.device
+            )
+            empty_id = torch.empty(
+                (0, k), dtype=torch.int64, device=hidden_states.device
+            )
+            return empty_lp, empty_id
+
+        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            raise RuntimeError(
+                "DFLASH top-k sampling requires a vocab-parallel head with "
+                "`weight` and `shard_indices`."
+            )
+
+        shard = lm_head.shard_indices
+        if int(shard.num_added_elements) > 0:
+            raise NotImplementedError(
+                "DFLASH best_first does not yet handle vocab heads with added tokens."
+            )
+
+        weight = lm_head.weight
+        num_org = int(shard.num_org_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+
+        hs = (
+            hidden_states
+            if hidden_states.dtype == weight.dtype
+            else hidden_states.to(weight.dtype)
+        )
+        # [N, num_org] in weight dtype; up-cast to float32 for stable log_softmax.
+        logits = torch.matmul(hs, weight[:num_org].T).float()
+        logprobs = torch.log_softmax(logits, dim=-1)
+        k_eff = min(int(k), num_org)
+        sorted_lp, sorted_local_ids = torch.topk(
+            logprobs, k=k_eff, dim=-1, sorted=True
+        )
+        sorted_ids = sorted_local_ids.to(torch.int64) + org_vocab_start
+        return sorted_lp, sorted_ids
 
     def _greedy_sample_from_vocab_parallel_head(
         self,

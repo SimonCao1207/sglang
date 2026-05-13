@@ -372,7 +372,19 @@ class FlashAttentionBackend(AttentionBackend):
             # TODO: we need to test this part for llama 4 eagle case
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
-            if self.topk <= 1:
+            # `self.topk` is set from server_args.speculative_eagle_topk at init
+            # and stays at 1 for DFLASH (forced). DFLASH best_first uses a real
+            # tree per verify step and signals that via spec_info.topk =
+            # verify_length (> 1). Either signal puts us on the tree path that
+            # consumes spec_info.custom_mask.
+            spec_info = forward_batch.spec_info
+            spec_info_topk = (
+                getattr(spec_info, "topk", None) if spec_info is not None else None
+            )
+            verify_is_tree = self.topk > 1 or (
+                spec_info_topk is not None and spec_info_topk > 1
+            )
+            if not verify_is_tree:
                 metadata.cache_seqlens_int32 = (
                     forward_batch.seq_lens + self.speculative_num_draft_tokens
                 ).to(torch.int32)
@@ -699,9 +711,18 @@ class FlashAttentionBackend(AttentionBackend):
         # We don't use cascade attention for Sliding Window Attention:
         # - Different window sizes should be passed in for each q in the first stage of cascade attention, but FA3 interface doesn't support pass in a list of window sizes.
         # - The overhead of duplicated computation of the common prefix part is small for sliding window layers (seq_len <= window_size), so we can just expand it.
+        # DFLASH best_first signals tree verify via spec_info.topk > 1 even though
+        # speculative_eagle_topk (and thus self.topk) is forced to 1 for DFLASH.
+        spec_info = forward_batch.spec_info
+        spec_info_topk = (
+            getattr(spec_info, "topk", None) if spec_info is not None else None
+        )
+        verify_is_tree = self.topk > 1 or (
+            spec_info_topk is not None and spec_info_topk > 1
+        )
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
-            and self.topk > 1
+            and verify_is_tree
             and not is_swa_layer
         )
 

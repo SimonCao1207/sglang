@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -20,6 +20,7 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
 )
+from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -158,8 +159,10 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
-    # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
-    # DFLASH verify is linear (non-tree), so this is always 1.
+    # `topk` here is the per-depth top-k of the draft distribution used to
+    # materialize the tree. Chain mode uses topk=1 (one candidate per depth).
+    # Some attention backends gate tree metadata on `topk > 1` — set it
+    # accordingly when running tree mode.
     topk: int = 1
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it (e.g. triton).
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
@@ -168,6 +171,25 @@ class DFlashVerifyInput(SpecInput):
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
+
+    # ------------------------------------------------------------------
+    # Tree fields. All optional; when None we are in chain mode and the
+    # verify path behaves exactly as it does today. Populated by the worker
+    # when --speculative-dflash-best-first-tokens is set.
+    # ------------------------------------------------------------------
+    retrieve_index: Optional[torch.Tensor] = None       # [bs, tree_size] int64
+    retrieve_next_token: Optional[torch.Tensor] = None  # [bs, tree_size] int64
+    retrieve_next_sibling: Optional[torch.Tensor] = None  # [bs, tree_size] int64
+    parent_indices: Optional[torch.Tensor] = None       # [tree_size] int64
+    depths: Optional[torch.Tensor] = None               # [tree_size] int64
+
+    # When True, verify() uses the tree-aware path (verify_tree_greedy_func +
+    # per-request gather of accepted slots). Chain mode leaves this False.
+    tree_mode: bool = False
+    # Per-request dense tree mask [bs, tree_size, tree_size]: tree_mask_dense[r, i, j]
+    # is True iff node j is an ancestor of node i in request r's tree (or j == i).
+    # Used by attention backends that consume a custom mask (e.g. triton).
+    tree_mask_dense: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -234,17 +256,33 @@ class DFlashVerifyInput(SpecInput):
             )
         mask_chunks: List[torch.Tensor] = []
         q_len = int(self.draft_token_num)
-        q_idx = torch.arange(q_len, device=batch.device, dtype=torch.int32).unsqueeze(1)
-        for prefix_len in batch.seq_lens_cpu.tolist():
-            prefix_len_i = int(prefix_len)
-            kv_len = prefix_len_i + q_len
-            k_idx = torch.arange(
-                kv_len, device=batch.device, dtype=torch.int32
-            ).unsqueeze(0)
-            # Allow attending to the full prefix and to tokens up to (and including) the
-            # current query position within the verify block (standard causal masking).
-            allow = k_idx <= (prefix_len_i + q_idx)
-            mask_chunks.append(allow.flatten())
+        if self.tree_mode:
+            if self.tree_mask_dense is None:
+                raise ValueError(
+                    "tree_mode=True requires tree_mask_dense [bs, T, T]."
+                )
+            for i, prefix_len in enumerate(batch.seq_lens_cpu.tolist()):
+                prefix_len_i = int(prefix_len)
+                prefix_part = torch.ones(
+                    (q_len, prefix_len_i), dtype=torch.bool, device=batch.device
+                )
+                tree_part = self.tree_mask_dense[i].to(batch.device)  # [T, T]
+                allow = torch.cat([prefix_part, tree_part], dim=1)
+                mask_chunks.append(allow.flatten())
+        else:
+            q_idx = torch.arange(
+                q_len, device=batch.device, dtype=torch.int32
+            ).unsqueeze(1)
+            for prefix_len in batch.seq_lens_cpu.tolist():
+                prefix_len_i = int(prefix_len)
+                kv_len = prefix_len_i + q_len
+                k_idx = torch.arange(
+                    kv_len, device=batch.device, dtype=torch.int32
+                ).unsqueeze(0)
+                # Allow attending to the full prefix and to tokens up to (and including) the
+                # current query position within the verify block (standard causal masking).
+                allow = k_idx <= (prefix_len_i + q_idx)
+                mask_chunks.append(allow.flatten())
         self.custom_mask = (
             torch.cat(mask_chunks, dim=0)
             if mask_chunks
@@ -363,6 +401,25 @@ class DFlashVerifyInput(SpecInput):
                 )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
+
+        if self.tree_mode:
+            if (
+                sampling_info is not None
+                and not sampling_info.is_all_greedy
+            ):
+                raise NotImplementedError(
+                    "DFLASH tree-mode (best_first) verify currently only supports "
+                    "greedy sampling. Use temperature=0 or disable best_first."
+                )
+            return self._verify_tree_greedy(
+                batch=batch,
+                logits_output=logits_output,
+                page_size=page_size,
+                bs=bs,
+                device=device,
+                candidates=candidates,
+            )
+
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -492,6 +549,183 @@ class DFlashVerifyInput(SpecInput):
         next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
 
         # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).
+        logits_output.hidden_states = None
+
+        return (
+            new_bonus_tokens,
+            commit_lens,
+            next_target_hidden,
+            num_correct_drafts_per_req_cpu,
+        )
+
+    def _verify_tree_greedy(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        page_size: int,
+        bs: int,
+        device: torch.device,
+        candidates: torch.Tensor,   # [bs, T] int (= self.draft_token reshaped)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
+        """Tree-mode greedy verification using sgl_kernel.verify_tree_greedy.
+
+        Branched out of `verify()` to keep the chain path bitexact.
+        """
+        if page_size != 1:
+            raise NotImplementedError(
+                "DFLASH tree-mode verify currently requires page_size == 1."
+            )
+        if self.retrieve_index is None or self.retrieve_next_token is None or self.retrieve_next_sibling is None:
+            raise ValueError(
+                "Tree-mode verify requires retrieve_index, retrieve_next_token, "
+                "retrieve_next_sibling on DFlashVerifyInput."
+            )
+
+        tree_size = int(self.draft_token_num)
+        # sgl_kernel.verify_tree_greedy expects candidates + target_predict in int64.
+        candidates_i64 = (
+            candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+        )
+        target_predict = torch.argmax(
+            logits_output.next_token_logits, dim=-1
+        ).view(bs, tree_size)
+        if target_predict.dtype != torch.int64:
+            target_predict = target_predict.to(torch.int64)
+
+        # Output buffers (kernel mutates these); EAGLE uses int32 for all three.
+        predicts = torch.empty(
+            (bs * tree_size,), dtype=torch.int32, device=device
+        )
+        accept_index = torch.full(
+            (bs, tree_size), -1, dtype=torch.int32, device=device
+        )
+        accept_token_num = torch.empty((bs,), dtype=torch.int32, device=device)
+
+        verify_tree_greedy_func(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrieve_index=self.retrieve_index,
+            retrieve_next_token=self.retrieve_next_token,
+            retrieve_next_sibling=self.retrieve_next_sibling,
+            target_predict=target_predict,
+            topk=int(self.topk),
+        )
+
+        # Single D2H batch.
+        # `accept_index` and `retrieve_index` are GLOBAL flat indices into
+        # the (bs * tree_size,) candidate / predicts arrays — same convention
+        # as `_get_or_create_chain_verify_buffers` (dflash_utils.py). Walk
+        # until -1; the kernel-reported `accept_token_num` counts accepted
+        # drafts only, so total appended = walk count = accept_token_num + 1.
+        accept_index_cpu = accept_index.cpu()
+        predicts_cpu = predicts.cpu()
+
+        num_correct_drafts_per_req_cpu: List[int] = []
+        commit_lens_cpu: List[int] = []
+        new_bonus_tokens_list: List[int] = []
+        accepted_global_indices_per_req: List[List[int]] = []
+
+        for i, req in enumerate(batch.reqs):
+            appended = 0
+            accepted_global: List[int] = []
+            for j in range(tree_size):
+                idx = int(accept_index_cpu[i, j].item())
+                if idx == -1:
+                    break
+                token_id = int(predicts_cpu[idx].item())
+                req.output_ids.append(token_id)
+                appended += 1
+                accepted_global.append(idx)
+                req.update_finish_state()
+                if req.finished():
+                    break
+                if req.grammar is not None:
+                    req.grammar.accept_token(token_id)
+
+            if req.output_ids:
+                new_bonus_token = int(req.output_ids[-1])
+            elif req.origin_input_ids:
+                new_bonus_token = int(req.origin_input_ids[-1])
+            else:
+                raise RuntimeError(
+                    "DFLASH verify cannot determine current token: both "
+                    "output_ids and origin_input_ids are empty."
+                )
+
+            commit_lens_cpu.append(appended)
+            new_bonus_tokens_list.append(new_bonus_token)
+            num_correct_drafts_per_req_cpu.append(max(0, appended - 1))
+            accepted_global_indices_per_req.append(accepted_global)
+            req.spec_verify_ct += 1
+            req.spec_num_correct_drafts += num_correct_drafts_per_req_cpu[-1]
+
+        commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+        new_bonus_tokens = torch.tensor(
+            new_bonus_tokens_list, dtype=torch.int64, device=device
+        )
+
+        # Flatten accepted GLOBAL indices into one [sum(commit_lens)] tensor.
+        # Order is per-request, then in-walk order (= output token order).
+        accepted_flat_list: List[int] = []
+        for accepted in accepted_global_indices_per_req:
+            accepted_flat_list.extend(accepted)
+
+        if accepted_flat_list:
+            accepted_flat = torch.tensor(
+                accepted_flat_list, dtype=torch.long, device=device
+            )
+            kept_slots = batch.out_cache_loc.index_select(0, accepted_flat)
+            # Build a flat keep mask over the [bs * tree_size] slot vector and
+            # free the slots that did NOT get kept.
+            keep_flat = torch.zeros(
+                (bs * tree_size,), dtype=torch.bool, device=device
+            )
+            keep_flat.scatter_(
+                0, accepted_flat, torch.ones_like(accepted_flat, dtype=torch.bool)
+            )
+            batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[~keep_flat])
+            batch.out_cache_loc = kept_slots
+        else:
+            batch.token_to_kv_pool_allocator.free(batch.out_cache_loc)
+            batch.out_cache_loc = batch.out_cache_loc[:0]
+
+        # Update per-req KV accounting.
+        for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
+            req.kv_committed_len += commit_len
+            req.kv_allocated_len = req.kv_committed_len
+
+        # Update req_to_token pool mapping.
+        end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            bs,
+        )
+
+        batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
+        batch.seq_lens_cpu.add_(
+            torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+        )
+        batch.seq_lens_sum += sum(commit_lens_cpu)
+
+        # next_target_hidden: gather hidden states at accepted GLOBAL indices.
+        hidden = logits_output.hidden_states
+        if hidden is None:
+            raise RuntimeError(
+                "DFLASH tree verify requires target hidden states, but got None."
+            )
+        hidden_flat = hidden.view(bs * tree_size, -1)
+        if accepted_flat_list:
+            next_target_hidden = hidden_flat.index_select(0, accepted_flat)
+        else:
+            next_target_hidden = hidden_flat[:0]
+
         logits_output.hidden_states = None
 
         return (

@@ -229,6 +229,49 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
         )
 
+    if server_args.speculative_dflash_best_first_tokens is not None:
+        verify_length = int(server_args.speculative_dflash_best_first_tokens)
+        if verify_length < 1:
+            raise ValueError(
+                "--speculative-dflash-best-first-tokens must be >= 1, "
+                f"got {verify_length}."
+            )
+        block_size = int(server_args.speculative_num_draft_tokens)
+        # best_first picks the rank-0 chain from each depth + siblings;
+        # so the tree spans at most `block_size` depths. verify_length
+        # itself isn't constrained by block_size — we just need enough
+        # depth + per-depth k for the heap to find verify_length nodes.
+        if verify_length > block_size * block_size:
+            logger.warning(
+                "best_first verify_length=%d is much larger than "
+                "block_size=%d squared; heap will be wide but trees may "
+                "still build correctly.",
+                verify_length,
+                block_size,
+            )
+        if not server_args.disable_cuda_graph:
+            server_args.disable_cuda_graph = True
+            logger.warning(
+                "CUDA graph is disabled because DFLASH best_first "
+                "verify is not yet graph-captured."
+            )
+        # triton consumes the dense custom_mask directly; fa3/fa4 consume
+        # the same mask via the page-table-rearrangement path in
+        # FlashAttentionBackend (verify-side, see flashattention_backend.py).
+        # flashinfer's custom-mask tree path is not wired yet.
+        best_first_allowed_backends = ("triton", "fa3", "fa4")
+        if (
+            server_args.attention_backend is not None
+            and server_args.attention_backend not in best_first_allowed_backends
+        ):
+            raise ValueError(
+                "DFLASH best_first requires --attention-backend in "
+                f"{best_first_allowed_backends}; got "
+                f"--attention-backend={server_args.attention_backend}."
+            )
+        if server_args.attention_backend is None:
+            server_args.attention_backend = "triton"
+
 
 def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
     if server_args.max_running_requests is None:
