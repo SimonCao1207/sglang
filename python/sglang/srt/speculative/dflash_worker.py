@@ -709,26 +709,24 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+        # Draft distributions live at depths 1..block_size-1.
+        draft_hidden_2d = draft_hidden[:, 1:, :].reshape(
+            -1, draft_hidden.shape[-1]
+        )  # [bs * (block_size - 1), hidden]
         positions = positions_2d.reshape(-1)
 
         if self.best_first_verify_length is not None:
             verify_length = int(self.best_first_verify_length)
             # Per-depth top-k draft sampling (TP=1; tp_size > 1 was rejected in __init__).
-            # hidden_states for draft are at depths 1..block_size-1.
-            draft_hidden_2d = draft_hidden[:, 1:, :].reshape(
-                -1, draft_hidden.shape[-1]
-            )  # [bs * (block_size - 1), hidden]
-            sorted_lp_flat, sorted_ids_flat = self._topk_logprobs_from_vocab_parallel_head(
-                hidden_states=draft_hidden_2d,
-                lm_head=lm_head,
-                k=verify_length,
+            # No greedy pass here: the chain-mode argmax is just rank 0 of this
+            # top-k, and a second projection would stream the whole lm_head
+            # weight (>1 GB) from HBM again for a result tree mode never reads.
+            sorted_lp_flat, sorted_ids_flat = (
+                self._topk_logprobs_from_vocab_parallel_head(
+                    hidden_states=draft_hidden_2d,
+                    lm_head=lm_head,
+                    k=verify_length,
+                )
             )
             # Reshape to [bs, block_size - 1, k].
             depth = int(self.block_size - 1)
@@ -744,18 +742,31 @@ class DFlashWorker:
             )
 
             # Stack per-request tensors. All trees have tree_size == verify_length.
-            tokens_b = torch.stack([t.tokens for t in trees]).to(self.device)
-            parents_b = torch.stack([t.parent_indices for t in trees]).to(self.device)
-            depths_b = torch.stack([t.depths for t in trees]).to(self.device)
-            first_child_b = torch.stack([t.first_child for t in trees]).to(self.device)
-            next_sibling_b = torch.stack([t.next_sibling for t in trees]).to(self.device)
+            # The five index tensors ship as one [5, bs, L] buffer: each separate
+            # `.to(device)` is a pageable H2D copy whose fixed cost dwarfs the
+            # few hundred bytes it moves. The field axis must lead so that
+            # unbinding it yields contiguous [bs, L] tensors — verify_tree_greedy
+            # requires contiguous inputs, and a [bs, 5, L] pack would only look
+            # contiguous at bs == 1.
+            meta_b = (
+                torch.stack(
+                    [
+                        torch.stack([t.tokens for t in trees]),
+                        torch.stack([t.parent_indices for t in trees]),
+                        torch.stack([t.depths for t in trees]),
+                        torch.stack([t.first_child for t in trees]),
+                        torch.stack([t.next_sibling for t in trees]),
+                    ]
+                )
+                .to(self.device, non_blocking=True)
+                .unbind(0)
+            )
+            tokens_b, parents_b, depths_b, first_child_b, next_sibling_b = meta_b
             tree_mask_dense_b = torch.stack(
                 [build_tree_mask_dense(t.parent_indices.tolist()) for t in trees]
-            ).to(self.device)
+            ).to(self.device, non_blocking=True)
 
-            retrieve_index_bf = torch.arange(
-                bs * verify_length, dtype=torch.int64, device=self.device
-            ).view(bs, verify_length)
+            retrieve_index_bf = self._get_tree_retrieve_index(bs, verify_length)
             tree_positions_bf = (
                 target_prefix_lens.to(torch.int64).unsqueeze(1) + depths_b
             ).reshape(-1)
@@ -774,6 +785,13 @@ class DFlashWorker:
                 tree_mask_dense=tree_mask_dense_b,
             )
         else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden_2d,
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
+            draft_tokens = self._draft_block_tokens_buf[:bs]
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
             verify_input = DFlashVerifyInput(
                 draft_token=draft_tokens.reshape(-1),
                 positions=positions,
@@ -801,6 +819,19 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+
+    def _get_tree_retrieve_index(self, bs: int, verify_length: int) -> torch.Tensor:
+        """Cached `arange(bs * L).view(bs, L)` for tree verify.
+
+        The values only ever depend on (bs, L), so grow one buffer and slice it
+        rather than launching a fresh arange every verify step.
+        """
+        buf = getattr(self, "_tree_retrieve_index_buf", None)
+        need = bs * verify_length
+        if buf is None or buf.numel() < need:
+            buf = torch.arange(need, dtype=torch.int64, device=self.device)
+            self._tree_retrieve_index_buf = buf
+        return buf[:need].view(bs, verify_length)
 
     def _topk_logprobs_from_vocab_parallel_head(
         self,
@@ -846,13 +877,17 @@ class DFlashWorker:
             if hidden_states.dtype == weight.dtype
             else hidden_states.to(weight.dtype)
         )
-        # [N, num_org] in weight dtype; up-cast to float32 for stable log_softmax.
-        logits = torch.matmul(hs, weight[:num_org].T).float()
-        logprobs = torch.log_softmax(logits, dim=-1)
+        # [N, num_org] in weight dtype. Rank the raw logits directly instead of
+        # materializing a full-vocab float32 log_softmax: log_softmax is a
+        # monotone shift by a per-row constant, so it cannot change the top-k or
+        # its order. Only the k retained values need the normalizer, which the
+        # float32 logsumexp below supplies at the same precision the log_softmax
+        # gave (`logits` is already the bf16 matmul output either way).
+        logits = torch.matmul(hs, weight[:num_org].T)
         k_eff = min(int(k), num_org)
-        sorted_lp, sorted_local_ids = torch.topk(
-            logprobs, k=k_eff, dim=-1, sorted=True
-        )
+        topk_vals, sorted_local_ids = torch.topk(logits, k=k_eff, dim=-1, sorted=True)
+        lse = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
+        sorted_lp = topk_vals.float() - lse
         sorted_ids = sorted_local_ids.to(torch.int64) + org_vocab_start
         return sorted_lp, sorted_ids
 

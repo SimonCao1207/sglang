@@ -1376,13 +1376,34 @@ class CudaGraphRunner:
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
+            # best_first verifies a tree, which always needs the dense custom
+            # mask and must reach the backend's tree metadata buffers. `topk` is
+            # how DFLASH signals that (speculative_eagle_topk stays 1), so it has
+            # to be set here too or capture builds chain metadata for a tree.
+            best_first_len = getattr(
+                self.model_runner.server_args,
+                "speculative_dflash_best_first_tokens",
+                None,
+            )
+            is_best_first = best_first_len is not None and not (
+                self.model_runner.is_draft_worker
+            )
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=(
+                    int(best_first_len)
+                    if is_best_first
+                    else self.model_runner.server_args.speculative_num_draft_tokens
+                ),
+                topk=int(best_first_len) if is_best_first else 1,
+                tree_mode=is_best_first,
                 custom_mask=(
                     None
-                    if (self.model_runner.is_draft_worker or not build_custom_mask)
+                    if (
+                        self.model_runner.is_draft_worker
+                        or not (build_custom_mask or is_best_first)
+                    )
                     else self.buffers.custom_mask
                 ),
                 capture_hidden_mode=(

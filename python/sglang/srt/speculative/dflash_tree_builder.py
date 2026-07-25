@@ -18,10 +18,20 @@ Additional builders (e.g. width_pruned) can be added alongside it.
 from __future__ import annotations
 
 import heapq
+import os
 from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
+
+# Additive bonus applied to a child's edge log-prob when pushing it onto the
+# heap. It biases best-first toward extending the current path instead of
+# collecting shallow siblings, trading breadth for depth. 0.0 reproduces plain
+# path-probability ordering. Borrowed from the DDTree builder (sgl-project PR
+# #27509), which uses 0.2; tune with SGLANG_DFLASH_TREE_DEPTH_BONUS.
+DEFAULT_DEPTH_BONUS: float = float(
+    os.environ.get("SGLANG_DFLASH_TREE_DEPTH_BONUS", "0.0")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -116,15 +126,35 @@ def build_tree_mask_dense(parent_indices: List[int]) -> torch.Tensor:
     For attention backends that consume an explicit tree mask. Backends in the
     DFLASH "skip custom mask" set handle the tree shape natively from the
     sibling pointers and don't need this.
+
+    Each row is accumulated as a Python int bitset and the [N, N] result is
+    expanded in one vectorized step. Scattering the ancestor bits straight into
+    a bool tensor instead costs one tensor op per ancestor edge, which dominates
+    the whole tree build at the sizes used here.
     """
     n = len(parent_indices)
-    mask = torch.eye(n, dtype=torch.bool)
+    if n > 63:
+        # Bitsets no longer fit an int64 lane; fall back to direct scatter.
+        mask = torch.eye(n, dtype=torch.bool)
+        for i in range(n):
+            p = parent_indices[i]
+            while p >= 0:
+                mask[i, p] = True
+                p = parent_indices[p]
+        return mask
+
+    row_bits: List[int] = [0] * n
     for i in range(n):
+        bits = 1 << i
         p = parent_indices[i]
         while p >= 0:
-            mask[i, p] = True
+            bits |= 1 << p
             p = parent_indices[p]
-    return mask
+        row_bits[i] = bits
+
+    rows = torch.tensor(row_bits, dtype=torch.int64).unsqueeze(1)
+    cols = torch.arange(n, dtype=torch.int64)
+    return ((rows >> cols) & 1).bool()
 
 
 def build_best_first_tree(
@@ -133,6 +163,7 @@ def build_best_first_tree(
     sorted_logprobs: List[List[float]],   # [depth][k]
     sorted_token_ids: List[List[int]],    # [depth][k]
     verify_length: int,
+    depth_bonus: float = None,
 ) -> BestFirstTreeOut:
     """Single-request best_first tree builder.
 
@@ -142,6 +173,8 @@ def build_best_first_tree(
             Shape [max_depth][k]. max_depth is `block_size - 1` for DFlash.
         sorted_token_ids: matching token ids at each (depth, rank).
         verify_length: total tree node budget (incl. root).
+        depth_bonus: additive bonus on each child edge log-prob, biasing the
+            search deeper. Defaults to DEFAULT_DEPTH_BONUS.
 
     Returns:
         BestFirstTreeOut with `tree_size == verify_length`.
@@ -152,6 +185,8 @@ def build_best_first_tree(
     """
     if verify_length < 1:
         raise ValueError(f"verify_length must be >= 1, got {verify_length}.")
+    if depth_bonus is None:
+        depth_bonus = DEFAULT_DEPTH_BONUS
 
     max_depth = len(sorted_logprobs)
     if max_depth > 0 and len(sorted_token_ids) != max_depth:
@@ -223,7 +258,9 @@ def build_best_first_tree(
             cand_rank.append(0)
             cand_edge_logprob.append(child_lp)
             cand_tree_idx.append(-1)
-            heapq.heappush(heap, (-(cur_path_lp + child_lp), child_id))
+            heapq.heappush(
+                heap, (-(cur_path_lp + child_lp + depth_bonus), child_id)
+            )
 
         # Push next sibling at same depth, rank+1, sharing the popped node's parent.
         if node_depth > 0:
@@ -282,6 +319,7 @@ def build_best_first_trees_batched(
     sorted_logprobs: torch.Tensor,      # [bs, depth, K] float
     sorted_token_ids: torch.Tensor,     # [bs, depth, K] int
     verify_length: int,
+    depth_bonus: float = None,
 ) -> List[BestFirstTreeOut]:
     """Build a best_first tree per request. Heap walk is CPU; inputs may be GPU.
 
@@ -320,6 +358,7 @@ def build_best_first_trees_batched(
                 sorted_logprobs=lp_cpu[i],
                 sorted_token_ids=ids_cpu[i],
                 verify_length=verify_length,
+                depth_bonus=depth_bonus,
             )
         )
     return trees

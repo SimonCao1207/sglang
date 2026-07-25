@@ -249,11 +249,22 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
                 verify_length,
                 block_size,
             )
-        if not server_args.disable_cuda_graph:
+        # best_first verify is graph-captured through the same tree buffers EAGLE
+        # uses, but those are sized from speculative_num_draft_tokens. A tree of a
+        # different width would overflow (or under-fill) them, so only the matched
+        # case can be captured.
+        if (
+            not server_args.disable_cuda_graph
+            and verify_length != server_args.speculative_num_draft_tokens
+        ):
             server_args.disable_cuda_graph = True
             logger.warning(
-                "CUDA graph is disabled because DFLASH best_first "
-                "verify is not yet graph-captured."
+                "CUDA graph is disabled because DFLASH best_first verify_length=%d "
+                "does not match speculative_num_draft_tokens=%d; the captured tree "
+                "metadata buffers are sized for the latter. Set them equal to keep "
+                "CUDA graphs.",
+                verify_length,
+                server_args.speculative_num_draft_tokens,
             )
         # triton consumes the dense custom_mask directly; fa3/fa4 consume
         # the same mask via the page-table-rearrangement path in
