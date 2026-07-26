@@ -18,9 +18,10 @@ Additional builders (e.g. width_pruned) can be added alongside it.
 from __future__ import annotations
 
 import heapq
+import math
 import os
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -157,6 +158,123 @@ def build_tree_mask_dense(parent_indices: List[int]) -> torch.Tensor:
     return ((rows >> cols) & 1).bool()
 
 
+def _grow_best_first_nodes(
+    *,
+    bonus_token_id: int,
+    sorted_logprobs: List[List[float]],
+    sorted_token_ids: List[List[int]],
+    max_nodes: int,
+    depth_bonus: float,
+) -> Tuple[List[int], List[int], List[int], List[float]]:
+    """Best-first heap walk, admitting up to `max_nodes` nodes.
+
+    Returns (tokens, parent_indices, depths, path_probs) in admission order,
+    where `path_probs[i]` is the *true* path probability (product of edge
+    probabilities from root to node i, root == 1.0). The heap ordering key
+    still folds in `depth_bonus` so the admission order — and hence any prefix
+    of the returned lists — is identical to what the fixed-budget builder would
+    produce; `path_probs` is tracked separately so the acceptance surrogate the
+    controller consumes is the unbiased path probability regardless of the bonus.
+
+    Stops early (returns fewer than `max_nodes`) only if the candidate heap is
+    exhausted. Callers that need an exact size must check the length.
+    """
+    max_depth = len(sorted_logprobs)
+
+    # Root-only.
+    if max_nodes <= 1 or max_depth == 0:
+        return [int(bonus_token_id)], [-1], [0], [1.0]
+
+    k_static = len(sorted_logprobs[0])
+    if k_static == 0:
+        raise ValueError("sorted_logprobs[0] must have at least one entry.")
+
+    # Candidate-space arrays. Index 0 is the root candidate (bonus token).
+    cand_parent: List[int] = [-1]            # parent in candidate space
+    cand_depth: List[int] = [0]
+    cand_token: List[int] = [int(bonus_token_id)]
+    cand_rank: List[int] = [-1]              # rank in per-depth top-k (-1 for root)
+    cand_edge_logprob: List[float] = [0.0]   # edge from parent->this; root edge is 0
+    cand_path_true: List[float] = [0.0]      # unbiased path log-prob (no depth_bonus)
+    cand_tree_idx: List[int] = [-1]          # output-tree index; -1 until visited
+
+    # Heap entries: (negated ordering key, candidate id). The key includes
+    # depth_bonus; the unbiased path log-prob lives in cand_path_true.
+    heap: List[Tuple[float, int]] = [(-0.0, 0)]
+
+    tree_tokens: List[int] = []
+    tree_parents: List[int] = []
+    tree_depths: List[int] = []
+    path_probs: List[float] = []
+
+    while heap and len(tree_tokens) < max_nodes:
+        neg_key, node_id = heapq.heappop(heap)
+        cur_key = -neg_key
+
+        parent_cand_id = cand_parent[node_id]
+        tree_parent = (
+            -1 if parent_cand_id < 0 else cand_tree_idx[parent_cand_id]
+        )
+        if parent_cand_id >= 0 and tree_parent < 0:
+            # Best-first invariant: parents always pop before children.
+            raise RuntimeError(
+                "Parent must be visited before child in best-first tree search."
+            )
+
+        tree_tokens.append(cand_token[node_id])
+        tree_parents.append(tree_parent)
+        tree_depths.append(cand_depth[node_id])
+        path_probs.append(math.exp(cand_path_true[node_id]))
+        cand_tree_idx[node_id] = len(tree_tokens) - 1
+
+        if len(tree_tokens) == max_nodes:
+            break
+
+        node_depth = cand_depth[node_id]
+        node_path_true = cand_path_true[node_id]
+
+        # Push first child at depth+1, rank 0.
+        if node_depth < max_depth:
+            child_depth = node_depth + 1
+            child_lp = sorted_logprobs[child_depth - 1][0]
+            child_tok = sorted_token_ids[child_depth - 1][0]
+            child_id = len(cand_parent)
+            cand_parent.append(node_id)
+            cand_depth.append(child_depth)
+            cand_token.append(child_tok)
+            cand_rank.append(0)
+            cand_edge_logprob.append(child_lp)
+            cand_path_true.append(node_path_true + child_lp)
+            cand_tree_idx.append(-1)
+            heapq.heappush(
+                heap, (-(cur_key + child_lp + depth_bonus), child_id)
+            )
+
+        # Push next sibling at same depth, rank+1, sharing the popped node's parent.
+        if node_depth > 0:
+            next_rank = cand_rank[node_id] + 1
+            if next_rank < k_static:
+                sib_lp = sorted_logprobs[node_depth - 1][next_rank]
+                sib_tok = sorted_token_ids[node_depth - 1][next_rank]
+                sib_id = len(cand_parent)
+                cand_parent.append(cand_parent[node_id])
+                cand_depth.append(node_depth)
+                cand_token.append(sib_tok)
+                cand_rank.append(next_rank)
+                cand_edge_logprob.append(sib_lp)
+                # Sibling shares the popped node's parent, so its unbiased path
+                # log-prob is parent_path + sib_edge = (node_path - popped_edge) + sib_edge.
+                cand_path_true.append(node_path_true - cand_edge_logprob[node_id] + sib_lp)
+                cand_tree_idx.append(-1)
+                # Ordering key: parent_key + sib_edge = (cur_key - popped_edge) + sib_edge.
+                heapq.heappush(
+                    heap,
+                    (-(cur_key - cand_edge_logprob[node_id] + sib_lp), sib_id),
+                )
+
+    return tree_tokens, tree_parents, tree_depths, path_probs
+
+
 def build_best_first_tree(
     *,
     bonus_token_id: int,
@@ -195,103 +313,22 @@ def build_best_first_tree(
             f"sorted_logprobs depth ({max_depth})."
         )
 
-    # Trivial root-only tree.
-    if verify_length == 1 or max_depth == 0:
-        return _finalize_tree(
-            tokens=[int(bonus_token_id)],
-            parent_indices=[-1],
-            depths=[0],
-        )
+    tokens, parents, depths, _ = _grow_best_first_nodes(
+        bonus_token_id=bonus_token_id,
+        sorted_logprobs=sorted_logprobs,
+        sorted_token_ids=sorted_token_ids,
+        max_nodes=verify_length,
+        depth_bonus=depth_bonus,
+    )
 
-    k_static = len(sorted_logprobs[0])
-    if k_static == 0:
-        raise ValueError("sorted_logprobs[0] must have at least one entry.")
-
-    # Candidate-space arrays. Index 0 is the root candidate (bonus token).
-    cand_parent: List[int] = [-1]            # parent in candidate space
-    cand_depth: List[int] = [0]
-    cand_token: List[int] = [int(bonus_token_id)]
-    cand_rank: List[int] = [-1]              # rank in per-depth top-k (-1 for root)
-    cand_edge_logprob: List[float] = [0.0]   # edge from parent->this; root edge is 0
-    cand_tree_idx: List[int] = [-1]          # output-tree index; -1 until visited
-
-    # Heap entries: (negated path log-prob, candidate id).
-    heap: List[Tuple[float, int]] = [(-0.0, 0)]
-
-    tree_tokens: List[int] = []
-    tree_parents: List[int] = []
-    tree_depths: List[int] = []
-
-    while heap and len(tree_tokens) < verify_length:
-        neg_path_lp, node_id = heapq.heappop(heap)
-        cur_path_lp = -neg_path_lp
-
-        parent_cand_id = cand_parent[node_id]
-        tree_parent = (
-            -1 if parent_cand_id < 0 else cand_tree_idx[parent_cand_id]
-        )
-        if parent_cand_id >= 0 and tree_parent < 0:
-            # Best-first invariant: parents always pop before children.
-            raise RuntimeError(
-                "Parent must be visited before child in best-first tree search."
-            )
-
-        tree_tokens.append(cand_token[node_id])
-        tree_parents.append(tree_parent)
-        tree_depths.append(cand_depth[node_id])
-        cand_tree_idx[node_id] = len(tree_tokens) - 1
-
-        if len(tree_tokens) == verify_length:
-            break
-
-        node_depth = cand_depth[node_id]
-
-        # Push first child at depth+1, rank 0.
-        if node_depth < max_depth:
-            child_depth = node_depth + 1
-            child_lp = sorted_logprobs[child_depth - 1][0]
-            child_tok = sorted_token_ids[child_depth - 1][0]
-            child_id = len(cand_parent)
-            cand_parent.append(node_id)
-            cand_depth.append(child_depth)
-            cand_token.append(child_tok)
-            cand_rank.append(0)
-            cand_edge_logprob.append(child_lp)
-            cand_tree_idx.append(-1)
-            heapq.heappush(
-                heap, (-(cur_path_lp + child_lp + depth_bonus), child_id)
-            )
-
-        # Push next sibling at same depth, rank+1, sharing the popped node's parent.
-        if node_depth > 0:
-            next_rank = cand_rank[node_id] + 1
-            if next_rank < k_static:
-                sib_lp = sorted_logprobs[node_depth - 1][next_rank]
-                sib_tok = sorted_token_ids[node_depth - 1][next_rank]
-                sib_id = len(cand_parent)
-                cand_parent.append(cand_parent[node_id])
-                cand_depth.append(node_depth)
-                cand_token.append(sib_tok)
-                cand_rank.append(next_rank)
-                cand_edge_logprob.append(sib_lp)
-                cand_tree_idx.append(-1)
-                # Sibling path = parent_path + sib_edge
-                #              = (cur_path - popped_edge) + sib_edge
-                heapq.heappush(
-                    heap,
-                    (-(cur_path_lp - cand_edge_logprob[node_id] + sib_lp), sib_id),
-                )
-
-    if len(tree_tokens) != verify_length:
+    if len(tokens) != verify_length:
         raise ValueError(
             f"Unable to build best-first tree with verify_length={verify_length}; "
-            f"heap exhausted after {len(tree_tokens)} nodes. Increase max_depth "
-            f"(currently {max_depth}) or per-depth k (currently {k_static})."
+            f"heap exhausted after {len(tokens)} nodes. Increase max_depth "
+            f"(currently {max_depth}) or per-depth k."
         )
 
-    return _finalize_tree(
-        tokens=tree_tokens, parent_indices=tree_parents, depths=tree_depths
-    )
+    return _finalize_tree(tokens=tokens, parent_indices=parents, depths=depths)
 
 
 def _finalize_tree(
@@ -362,3 +399,198 @@ def build_best_first_trees_batched(
             )
         )
     return trees
+
+
+# ---------------------------------------------------------------------------
+# Adaptive shared-budget controller
+#
+# Ports BASTION's per-request marginal cost/benefit stop rule
+# (`bastion/tree_draft.py::build_adaptive_best_tree_from_draft_logits`) to
+# synchronous batched decoding. BASTION grows a single request's tree until the
+# marginal path-probability no longer pays for the marginal verify cost. Under
+# batching every request shares ONE budget N (required by SGLang's rectangular
+# `[bs, N]` verify), so the controller maximizes the batch objective
+#
+#     S_B(N) = (mean_b A_b(N)) * L_AR(B) / C_B(N),
+#
+# where A_b(N) is request b's accepted-length surrogate (sum of the true path
+# probabilities of its first N best-first nodes; the root/bonus contributes 1.0)
+# and C_B(N) = D_B + O_B + V_B(N). Each A_b is concave (best-first admits nodes
+# in non-increasing path-probability order), so the batch average is concave; a
+# convex C_B then makes S_B unimodal and the greedy marginal stop rule finds the
+# argmax. Both sides of the stop test scale with any global latency factor, so
+# N* depends only on the *relative* cost shape — see dflash_cost_model.py.
+# ---------------------------------------------------------------------------
+
+
+def select_shared_budget(
+    *,
+    accept_marginals: Sequence[Sequence[float]],
+    batch_size: int,
+    context_sum: int,
+    cost_model,
+    min_budget: int,
+    max_budget: int,
+) -> int:
+    """Pick the shared tree budget N* for a batched speculative cycle.
+
+    Args:
+        accept_marginals: per-request path-probability sequences in best-first
+            admission order (`accept_marginals[b][n-1]` = p_b(n), the unbiased
+            path probability of request b's n-th node; index 0 is the root, 1.0).
+            Sequences may be shorter than `max_budget`; missing entries count 0.
+        batch_size: B.
+        context_sum: sum_b of per-request context (prefix) lengths.
+        cost_model: object exposing `fixed_overhead_s(B)`, `estimate_verify(B, N,
+            context_sum)`. When it is None or not yet calibrated
+            (`fixed_overhead_s` returns None), we fall back to `max_budget`.
+        min_budget, max_budget: inclusive bounds on N*.
+
+    Returns:
+        N* in [min_budget, max_budget].
+    """
+    if max_budget < 1:
+        raise ValueError(f"max_budget must be >= 1, got {max_budget}.")
+    hi = int(max_budget)
+    lo = max(1, min(int(min_budget), hi))
+    if cost_model is None:
+        return hi
+
+    fixed = cost_model.fixed_overhead_s(batch_size)
+    if fixed is None:
+        return hi  # not calibrated yet: largest tree is the safe default
+    if hi <= lo:
+        return hi
+
+    B = max(1, int(batch_size))
+    inv_b = 1.0 / B
+
+    # avg_marginal[n-1] = mean_b p_b(n), averaged over the batch (missing = 0).
+    avg_marginal = [0.0] * hi
+    for pp in accept_marginals:
+        m = min(len(pp), hi)
+        for n in range(m):
+            avg_marginal[n] += pp[n]
+    for n in range(hi):
+        avg_marginal[n] *= inv_b
+
+    # A_bar(N) = sum_{n<=N} avg_marginal[n]; start at N = lo.
+    accept = sum(avg_marginal[:lo])
+    verify_n = cost_model.estimate_verify(B, lo, context_sum)
+    for n in range(lo, hi):
+        marginal_next = avg_marginal[n]  # p(n+1) averaged over the batch
+        verify_next = cost_model.estimate_verify(B, n + 1, context_sum)
+        delta_verify = verify_next - verify_n
+        cost_n = fixed + verify_n
+        # Stop before growing to n+1 once the marginal ratio drops to/below the
+        # average ratio: marginal_next / delta_verify <= accept / cost_n.
+        if marginal_next * cost_n <= accept * delta_verify:
+            return n
+        accept += marginal_next
+        verify_n = verify_next
+    return hi
+
+
+def build_adaptive_best_first_trees_batched(
+    *,
+    bonus_tokens: torch.Tensor,         # [bs] int (any int dtype)
+    sorted_logprobs: torch.Tensor,      # [bs, depth, K] float
+    sorted_token_ids: torch.Tensor,     # [bs, depth, K] int
+    max_budget: int,
+    min_budget: int,
+    cost_model,
+    context_sum: int,
+    depth_bonus: Optional[float] = None,
+) -> Tuple[List[BestFirstTreeOut], int, dict]:
+    """Build one best_first tree per request under a controller-selected budget.
+
+    Grows every request's tree to `max_budget` (recording per-node path
+    probabilities), asks the controller for a single shared budget N*, then
+    truncates each tree to N*. A truncated best-first tree stays valid because
+    parents are always admitted before their children. Returns
+    ``(trees, budget, stats)`` — all trees have ``tree_size == budget``.
+    """
+    if bonus_tokens.dim() != 1:
+        raise ValueError(
+            f"bonus_tokens must be 1D [bs], got shape {tuple(bonus_tokens.shape)}."
+        )
+    if sorted_logprobs.dim() != 3:
+        raise ValueError(
+            "sorted_logprobs must be 3D [bs, depth, K], got shape "
+            f"{tuple(sorted_logprobs.shape)}."
+        )
+    if sorted_logprobs.shape != sorted_token_ids.shape:
+        raise ValueError(
+            "sorted_logprobs and sorted_token_ids must have the same shape; got "
+            f"{tuple(sorted_logprobs.shape)} vs {tuple(sorted_token_ids.shape)}."
+        )
+    bs = int(bonus_tokens.shape[0])
+    if int(sorted_logprobs.shape[0]) != bs:
+        raise ValueError(
+            f"sorted_logprobs batch dim {sorted_logprobs.shape[0]} != "
+            f"bonus_tokens batch dim {bs}."
+        )
+    if max_budget < 1:
+        raise ValueError(f"max_budget must be >= 1, got {max_budget}.")
+    if depth_bonus is None:
+        depth_bonus = DEFAULT_DEPTH_BONUS
+
+    bonus_cpu = bonus_tokens.detach().cpu().tolist()
+    lp_cpu = sorted_logprobs.detach().float().cpu().tolist()
+    ids_cpu = sorted_token_ids.detach().long().cpu().tolist()
+
+    grown: List[Tuple[List[int], List[int], List[int], List[float]]] = []
+    reachable = int(max_budget)
+    for i in range(bs):
+        tokens, parents, depths, path_probs = _grow_best_first_nodes(
+            bonus_token_id=int(bonus_cpu[i]),
+            sorted_logprobs=lp_cpu[i],
+            sorted_token_ids=ids_cpu[i],
+            max_nodes=int(max_budget),
+            depth_bonus=depth_bonus,
+        )
+        grown.append((tokens, parents, depths, path_probs))
+        reachable = min(reachable, len(tokens))
+
+    # Every request must be able to fill the chosen budget for rectangular
+    # batching, so cap selection at the smallest reachable tree.
+    hi = max(1, min(int(max_budget), reachable))
+    lo = max(1, min(int(min_budget), hi))
+    budget = select_shared_budget(
+        accept_marginals=[g[3] for g in grown],
+        batch_size=bs,
+        context_sum=int(context_sum),
+        cost_model=cost_model,
+        min_budget=lo,
+        max_budget=hi,
+    )
+    budget = max(1, min(int(budget), reachable))
+
+    trees: List[BestFirstTreeOut] = []
+    accept_sum = 0.0
+    for tokens, parents, depths, path_probs in grown:
+        trees.append(
+            _finalize_tree(
+                tokens=tokens[:budget],
+                parent_indices=parents[:budget],
+                depths=depths[:budget],
+            )
+        )
+        accept_sum += float(sum(path_probs[:budget]))
+
+    avg_accept = accept_sum / bs if bs > 0 else 0.0
+    stats: dict = {
+        "budget": int(budget),
+        "max_budget": int(max_budget),
+        "reachable": int(reachable),
+        "avg_accept": avg_accept,
+        "calibrated": bool(cost_model is not None and cost_model.is_ready(bs)),
+    }
+    if stats["calibrated"]:
+        est_verify = cost_model.estimate_verify(bs, budget, int(context_sum))
+        est_cycle = cost_model.fixed_overhead_s(bs) + est_verify
+        ar_latency = cost_model.ar_latency_s(bs, int(context_sum))
+        stats["est_cycle_s"] = est_cycle
+        stats["est_speedup"] = (avg_accept * ar_latency / est_cycle) if est_cycle > 0 else 0.0
+
+    return trees, int(budget), stats

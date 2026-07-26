@@ -283,6 +283,40 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         if server_args.attention_backend is None:
             server_args.attention_backend = "triton"
 
+        if server_args.speculative_dflash_adaptive_tree:
+            # The adaptive controller varies the verify budget N* every step, so
+            # a captured tree graph would never match. Force eager verify.
+            if not server_args.disable_cuda_graph:
+                server_args.disable_cuda_graph = True
+                logger.warning(
+                    "CUDA graph is disabled because DFLASH adaptive tree mode "
+                    "varies the verify budget N* every step."
+                )
+            min_tokens = server_args.speculative_dflash_tree_min_tokens
+            if min_tokens is not None:
+                if int(min_tokens) < 1:
+                    raise ValueError(
+                        "--speculative-dflash-tree-min-tokens must be >= 1, got "
+                        f"{min_tokens}."
+                    )
+                if int(min_tokens) > verify_length:
+                    raise ValueError(
+                        "--speculative-dflash-tree-min-tokens "
+                        f"({min_tokens}) must be <= "
+                        f"--speculative-dflash-best-first-tokens (N_max={verify_length})."
+                    )
+            logger.info(
+                "DFLASH adaptive tree enabled: N_max=%d, min_tokens=%s. The verify "
+                "cost model is calibrated by a synthetic startup sweep, then frozen.",
+                verify_length,
+                min_tokens if min_tokens is not None else 1,
+            )
+    elif server_args.speculative_dflash_adaptive_tree:
+        raise ValueError(
+            "--speculative-dflash-adaptive-tree requires "
+            "--speculative-dflash-best-first-tokens (the budget upper bound N_max)."
+        )
+
 
 def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
     if server_args.max_running_requests is None:
