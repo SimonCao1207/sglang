@@ -554,6 +554,8 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_best_first_tokens: Optional[int] = None
+    speculative_dflash_tree_method: str = "best_first"
+    speculative_dflash_beam_width: Optional[int] = None
     speculative_dflash_adaptive_tree: bool = False
     speculative_dflash_tree_min_tokens: Optional[int] = None
     speculative_dflash_cost_calibration_path: Optional[str] = None
@@ -5459,12 +5461,29 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-dflash-best-first-tokens",
             type=int,
-            help="DFLASH only. When set, runs the best_first tree builder with "
-            "this many tree nodes per verify step (incl. root). Requires the "
-            "triton attention backend and --disable-cuda-graph (auto-applied). "
-            "With --speculative-dflash-adaptive-tree this is the budget upper "
-            "bound N_max.",
+            help="DFLASH only. When set, builds a dynamic tree with this many "
+            "nodes per verify step (incl. root). Requires the triton attention "
+            "backend and --disable-cuda-graph (auto-applied). With "
+            "--speculative-dflash-adaptive-tree this is the upper bound N_max.",
             default=ServerArgs.speculative_dflash_best_first_tokens,
+        )
+        parser.add_argument(
+            "--speculative-dflash-tree-method",
+            type=str,
+            choices=["best_first", "beam_search"],
+            help="DFLASH tree builder: 'best_first' (global heap over path "
+            "probability) or 'beam_search' (level-synchronous beam, requires "
+            "--speculative-dflash-beam-width and rules out "
+            "--speculative-dflash-adaptive-tree).",
+            default=ServerArgs.speculative_dflash_tree_method,
+        )
+        parser.add_argument(
+            "--speculative-dflash-beam-width",
+            type=int,
+            help="DFLASH beam_search only. Nodes kept per depth; the tree is "
+            "always full-depth, so its size is 1 + width * (block_size - 1) "
+            "and --speculative-dflash-best-first-tokens is ignored.",
+            default=ServerArgs.speculative_dflash_beam_width,
         )
         parser.add_argument(
             "--speculative-dflash-adaptive-tree",

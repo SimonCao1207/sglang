@@ -24,7 +24,9 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_tree_builder import (
+    beam_tree_size,
     build_adaptive_best_first_trees_batched,
+    build_beam_search_trees_batched,
     build_best_first_trees_batched,
     build_tree_mask_dense,
 )
@@ -239,10 +241,27 @@ class DFlashWorker:
             self._init_fused_kv_helper()
 
         self.best_first_verify_length: Optional[int] = None
+        self.tree_method: str = getattr(
+            server_args, "speculative_dflash_tree_method", "best_first"
+        )
+        self.beam_width: Optional[int] = getattr(
+            server_args, "speculative_dflash_beam_width", None
+        )
         if server_args.speculative_dflash_best_first_tokens is not None:
             self.best_first_verify_length = int(
                 server_args.speculative_dflash_best_first_tokens
             )
+            if self.tree_method == "beam_search":
+                # beam_search is always full-depth, so its size comes from the
+                # width, not --best-first-tokens.
+                if self.beam_width is None:
+                    raise ValueError(
+                        "--speculative-dflash-tree-method=beam_search requires "
+                        "--speculative-dflash-beam-width."
+                    )
+                self.best_first_verify_length = beam_tree_size(
+                    int(self.beam_width), self.block_size - 1
+                )
             if int(server_args.tp_size) > 1:
                 raise NotImplementedError(
                     "DFLASH best_first does not yet support tp_size > 1 "
@@ -258,9 +277,10 @@ class DFlashWorker:
 
             if self.tp_rank == 0:
                 logger.info(
-                    "DFLASH best_first tree mode enabled: verify_length=%d, "
+                    "DFLASH %s tree mode enabled: verify_length=%d, "
                     "max_depth=%d (= block_size - 1). Overrode target "
                     "attention backend num_draft_tokens to %d.",
+                    self.tree_method,
                     self.best_first_verify_length,
                     self.block_size - 1,
                     self.best_first_verify_length,
@@ -287,6 +307,7 @@ class DFlashWorker:
         self._sweep_last = {}
         self._sweep_overhead_t0 = None
         self._calib_dump_path = None
+        self._calib_cost = None  # {total_ms, sweep_ms, fit_ms, points, cycles} after fit
         if self.adaptive_tree:
             if self.best_first_verify_length is None:
                 raise ValueError(
@@ -322,26 +343,45 @@ class DFlashWorker:
             self._calib_dump_path = getattr(
                 server_args, "speculative_dflash_cost_calibration_path", None
             )
+            # Calibration mode for the calibration ablation. 'fit' (default) runs the
+            # startup sweep and fits the affine roofline; 'raw' skips it and selects
+            # N* from the raw analytical roofline (uncalibrated). Env-toggled so an
+            # A/B run needs no code change: SGLANG_DFLASH_CALIB_MODE=raw|fit.
+            self._calib_mode = (
+                os.environ.get("SGLANG_DFLASH_CALIB_MODE", "fit").strip().lower()
+            )
 
-            if self.tp_rank == 0:
-                logger.info(
-                    "DFLASH adaptive tree mode enabled: N_max=%d, min_budget=%d, "
-                    "gpu=%s. Calibrating the verify cost model at startup...",
-                    self.best_first_verify_length,
-                    self.adaptive_min_budget,
-                    gpu_name,
-                )
-            # One-shot calibration on the real verify kernels, then serve frozen.
-            self._run_startup_calibration_sweep()
-            if self._calib_dump_path and self.tp_rank == 0:
-                try:
-                    self.adaptive_cost_model.dump_calibration(self._calib_dump_path)
+            if self._calib_mode == "raw":
+                self.adaptive_cost_model.raw_mode = True
+                if self.tp_rank == 0:
                     logger.info(
-                        "DFLASH dumped fitted calibration to %s.",
-                        self._calib_dump_path,
+                        "DFLASH adaptive tree enabled: N_max=%d, min_budget=%d, gpu=%s, "
+                        "calibration=RAW (uncalibrated). Skipping the startup sweep; N* "
+                        "is chosen from the analytical roofline with zero fixed overhead.",
+                        self.best_first_verify_length,
+                        self.adaptive_min_budget,
+                        gpu_name,
                     )
-                except Exception as e:
-                    logger.warning("DFLASH calibration dump failed: %s", e)
+            else:
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH adaptive tree enabled: N_max=%d, min_budget=%d, gpu=%s, "
+                        "calibration=FIT. Calibrating the verify cost model at startup...",
+                        self.best_first_verify_length,
+                        self.adaptive_min_budget,
+                        gpu_name,
+                    )
+                # One-shot calibration on the real verify kernels, then serve frozen.
+                self._run_startup_calibration_sweep()
+                if self._calib_dump_path and self.tp_rank == 0:
+                    try:
+                        self.adaptive_cost_model.dump_calibration(self._calib_dump_path)
+                        logger.info(
+                            "DFLASH dumped fitted calibration to %s.",
+                            self._calib_dump_path,
+                        )
+                    except Exception as e:
+                        logger.warning("DFLASH calibration dump failed: %s", e)
 
     def _set_target_draft_token_count(self, n: int) -> None:
         """Point the target verify attention backends at a tree size of `n`.
@@ -534,6 +574,11 @@ class DFlashWorker:
         import traceback as _tb
 
         samples: list = []
+        n_points = 0   # (batch, tree_size) grid points attempted
+        n_cycles = 0   # total prefill->draft->verify cycles run (warmup + measured)
+        # Sync so the measured wall-clock reflects only the sweep, not pending
+        # model-load/warmup work already queued on the device.
+        torch.cuda.synchronize(self.device)
         t_start = time.perf_counter()
         self._sweeping = True
         try:
@@ -541,10 +586,12 @@ class DFlashWorker:
                 # Shrink per-request context for large batches to stay in the pool.
                 ctx_len = max(128, min(context_len, max_sweep_tokens // bs))
                 for budget in tree_grid:
+                    n_points += 1
                     best: Optional[dict] = None
                     for rep in range(warmup_repeats + measure_repeats):
                         try:
                             timed = _one_cycle(bs, budget, ctx_len)
+                            n_cycles += 1
                         except Exception as e:
                             frames = _tb.extract_tb(e.__traceback__)
                             loc = (
@@ -585,6 +632,8 @@ class DFlashWorker:
                 _clear_pools()
             except Exception:
                 pass
+        torch.cuda.synchronize(self.device)
+        sweep_ms = (time.perf_counter() - t_start) * 1e3
 
         if not samples:
             logger.warning(
@@ -592,13 +641,29 @@ class DFlashWorker:
                 "uncalibrated analytical roofline (N* selection may be less accurate)."
             )
             return
+        t_fit = time.perf_counter()
         summary = self.adaptive_cost_model.fit_from_samples(samples)
+        fit_ms = (time.perf_counter() - t_fit) * 1e3
+        # Record so the cost can be embedded in the dumped calibration / cited.
+        self._calib_cost = {
+            "total_ms": sweep_ms + fit_ms,
+            "sweep_ms": sweep_ms,
+            "fit_ms": fit_ms,
+            "points": n_points,
+            "cycles": n_cycles,
+            "ms_per_cycle": (sweep_ms / n_cycles) if n_cycles else None,
+        }
         if self.tp_rank == 0:
             logger.info(
-                "DFLASH calibration fit complete in %.1fs from %d samples over "
-                "batch=%s tree=%s (ctx=%d): buckets=%s",
-                time.perf_counter() - t_start,
-                len(samples),
+                "DFLASH calibration added %.0fms to startup: sweep=%.0fms "
+                "(%d points, %d cycles, %.1fms/cycle) + fit=%.1fms. "
+                "batch=%s tree=%s ctx<=%d buckets=%s",
+                sweep_ms + fit_ms,
+                sweep_ms,
+                n_points,
+                n_cycles,
+                (sweep_ms / n_cycles) if n_cycles else float("nan"),
+                fit_ms,
                 batch_grid,
                 tree_grid,
                 context_len,
@@ -1109,12 +1174,23 @@ class DFlashWorker:
                     )
             else:
                 verify_length = n_max
-                trees = build_best_first_trees_batched(
-                    bonus_tokens=bonus_tokens,
-                    sorted_logprobs=sorted_logprobs,
-                    sorted_token_ids=sorted_token_ids,
-                    verify_length=verify_length,
-                )
+                if self.tree_method == "beam_search":
+                    # Width-pruned beam over the FULL block depth; tree size =
+                    # 1 + width*(block_size - 1) == verify_length (set at init).
+                    trees = build_beam_search_trees_batched(
+                        bonus_tokens=bonus_tokens,
+                        sorted_logprobs=sorted_logprobs,
+                        sorted_token_ids=sorted_token_ids,
+                        width=int(self.beam_width),
+                        max_depth=self.block_size - 1,
+                    )
+                else:
+                    trees = build_best_first_trees_batched(
+                        bonus_tokens=bonus_tokens,
+                        sorted_logprobs=sorted_logprobs,
+                        sorted_token_ids=sorted_token_ids,
+                        verify_length=verify_length,
+                    )
 
             # Stack per-request tensors. All trees have tree_size == verify_length.
             # The five index tensors ship as one [5, bs, L] buffer: each separate

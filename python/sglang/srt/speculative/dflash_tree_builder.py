@@ -402,6 +402,171 @@ def build_best_first_trees_batched(
 
 
 # ---------------------------------------------------------------------------
+# beam_search (width-pruned) dynamic tree builder
+#
+# Ported from spec-dllm `model/tree_builder.py::build_width_pruned_tree_from_draft_logits`.
+# Classic beam search: expand every frontier node by the per-depth top-k, keep the
+# `width` highest cumulative-path-prob candidates as that depth's layer, and
+# continue to the FULL block depth (block_size - 1). Unlike best_first there is no
+# node budget cap — the tree always reaches max_depth, so paths can be up to
+# max_depth long (acceptance is NOT capped at the width). Total nodes are a
+# consequence of the width: 1 + width * max_depth (given width <= per-depth k). The
+# fixed shape keeps batched verify rectangular.
+# ---------------------------------------------------------------------------
+
+
+def beam_tree_size(width: int, max_depth: int) -> int:
+    """Node count (incl. root) of a full-depth width-`width` beam tree."""
+    return 1 + max(1, int(width)) * max(0, int(max_depth))
+
+
+def _grow_beam_search_nodes(
+    *,
+    bonus_token_id: int,
+    sorted_logprobs: List[List[float]],
+    sorted_token_ids: List[List[int]],
+    width: int,
+    max_depth: Optional[int] = None,
+) -> Tuple[List[int], List[int], List[int], List[float]]:
+    """Width-pruned (beam) expansion to the FULL `max_depth`.
+
+    At each depth d in 1..max_depth, forms candidates by extending every frontier
+    node with the per-depth top-k tokens, keeps the `width` highest by cumulative
+    path log-prob, and advances. Returns (tokens, parent_indices, depths,
+    path_probs) in level order (parents precede children). Total nodes =
+    1 + width * max_depth when each depth has >= width candidates (true when the
+    per-depth top-k has at least `width` entries). Matches spec-dllm width_pruned.
+    """
+    depth_avail = len(sorted_logprobs)
+    if max_depth is None:
+        max_depth = depth_avail
+    max_depth = max(0, min(int(max_depth), depth_avail))
+    width = max(1, int(width))
+
+    if max_depth == 0:
+        return [int(bonus_token_id)], [-1], [0], [1.0]
+
+    tree_tokens: List[int] = [int(bonus_token_id)]
+    tree_parents: List[int] = [-1]
+    tree_depths: List[int] = [0]
+    path_probs: List[float] = [1.0]
+
+    # Frontier entries: (tree_index, cumulative path log-prob).
+    frontier: List[Tuple[int, float]] = [(0, 0.0)]
+
+    for depth in range(1, max_depth + 1):
+        row_lp = sorted_logprobs[depth - 1]
+        row_tok = sorted_token_ids[depth - 1]
+        kk = len(row_lp)
+        candidates: List[Tuple[float, int, int]] = []
+        for pidx, base in frontier:
+            for r in range(kk):
+                candidates.append((base + row_lp[r], pidx, row_tok[r]))
+        if not candidates:
+            break
+        n_sel = min(width, len(candidates))
+        selected = heapq.nlargest(n_sel, candidates, key=lambda c: c[0])
+
+        new_frontier: List[Tuple[int, float]] = []
+        for score, pidx, tok in selected:
+            idx = len(tree_tokens)
+            tree_tokens.append(int(tok))
+            tree_parents.append(int(pidx))
+            tree_depths.append(depth)
+            path_probs.append(math.exp(score))
+            new_frontier.append((idx, score))
+        frontier = new_frontier
+
+    return tree_tokens, tree_parents, tree_depths, path_probs
+
+
+def build_beam_search_tree(
+    *,
+    bonus_token_id: int,
+    sorted_logprobs: List[List[float]],   # [depth][k]
+    sorted_token_ids: List[List[int]],    # [depth][k]
+    width: int,
+    max_depth: Optional[int] = None,
+) -> BestFirstTreeOut:
+    """Single-request width-pruned (beam) tree builder.
+
+    Builds a full-depth beam of width `width`; the resulting tree_size is
+    ``1 + width * max_depth`` (max_depth defaults to the number of draft depths).
+    Returns a ``BestFirstTreeOut``, so it is a drop-in for the verify path.
+    """
+    if width < 1:
+        raise ValueError(f"width must be >= 1, got {width}.")
+
+    depth_avail = len(sorted_logprobs)
+    if depth_avail > 0 and len(sorted_token_ids) != depth_avail:
+        raise ValueError(
+            f"sorted_token_ids depth ({len(sorted_token_ids)}) does not match "
+            f"sorted_logprobs depth ({depth_avail})."
+        )
+
+    tokens, parents, depths, _ = _grow_beam_search_nodes(
+        bonus_token_id=bonus_token_id,
+        sorted_logprobs=sorted_logprobs,
+        sorted_token_ids=sorted_token_ids,
+        width=width,
+        max_depth=max_depth,
+    )
+    return _finalize_tree(tokens=tokens, parent_indices=parents, depths=depths)
+
+
+def build_beam_search_trees_batched(
+    *,
+    bonus_tokens: torch.Tensor,         # [bs] int (any int dtype)
+    sorted_logprobs: torch.Tensor,      # [bs, depth, K] float
+    sorted_token_ids: torch.Tensor,     # [bs, depth, K] int
+    width: int,
+    max_depth: Optional[int] = None,
+) -> List[BestFirstTreeOut]:
+    """Build a width-pruned (beam) tree per request. Beam walk is CPU; inputs GPU.
+
+    All trees have the same size (``1 + width * max_depth``), so the batched verify
+    stays rectangular. Mirrors :func:`build_best_first_trees_batched`.
+    """
+    if bonus_tokens.dim() != 1:
+        raise ValueError(
+            f"bonus_tokens must be 1D [bs], got shape {tuple(bonus_tokens.shape)}."
+        )
+    if sorted_logprobs.dim() != 3:
+        raise ValueError(
+            "sorted_logprobs must be 3D [bs, depth, K], got shape "
+            f"{tuple(sorted_logprobs.shape)}."
+        )
+    if sorted_logprobs.shape != sorted_token_ids.shape:
+        raise ValueError(
+            "sorted_logprobs and sorted_token_ids must have the same shape; got "
+            f"{tuple(sorted_logprobs.shape)} vs {tuple(sorted_token_ids.shape)}."
+        )
+    bs = int(bonus_tokens.shape[0])
+    if int(sorted_logprobs.shape[0]) != bs:
+        raise ValueError(
+            f"sorted_logprobs batch dim {sorted_logprobs.shape[0]} != "
+            f"bonus_tokens batch dim {bs}."
+        )
+
+    bonus_cpu = bonus_tokens.detach().cpu().tolist()
+    lp_cpu = sorted_logprobs.detach().float().cpu().tolist()
+    ids_cpu = sorted_token_ids.detach().long().cpu().tolist()
+
+    trees: List[BestFirstTreeOut] = []
+    for i in range(bs):
+        trees.append(
+            build_beam_search_tree(
+                bonus_token_id=int(bonus_cpu[i]),
+                sorted_logprobs=lp_cpu[i],
+                sorted_token_ids=ids_cpu[i],
+                width=width,
+                max_depth=max_depth,
+            )
+        )
+    return trees
+
+
+# ---------------------------------------------------------------------------
 # Adaptive shared-budget controller
 #
 # Ports BASTION's per-request marginal cost/benefit stop rule

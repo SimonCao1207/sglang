@@ -30,18 +30,24 @@ export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 ATTN_BACKEND="${ATTN_BACKEND:-triton}"
 DRAFT_BACKEND="${DRAFT_BACKEND:-fa3}"
 PORT="${PORT:-30000}"
+# Target + DFlash draft model. Override both together to switch models, e.g.:
+#   MODEL=Qwen/Qwen3-4B DRAFT_MODEL=z-lab/Qwen3-4B-DFlash-b16 ./run_dflash_best_first_tree_offline.sh
+MODEL="${MODEL:-Qwen/Qwen3-8B}"
+DRAFT_MODEL="${DRAFT_MODEL:-z-lab/Qwen3-8B-DFlash-b16}"
 # N_max (budget upper bound) and the per-cycle floor. Match run_dflash_adaptive_tree.sh.
 MAX_TOKENS="${MAX_TOKENS:-64}"
 MIN_TOKENS="${MIN_TOKENS:-1}"
-# Optional: dump the fitted startup calibration here for inspection / records.
-CALIB="${CALIB:-$(dirname "$0")/dflash_calib.json}"
+# Dump the fitted startup calibration to a per-model file so switching models
+# never clobbers another model's calibration (e.g. dflash_calib_qwen3-8b.json).
+MODEL_SLUG="$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')"
+CALIB="${CALIB:-$(dirname "$0")/dflash_calib_${MODEL_SLUG}.json}"
 
-echo "DFLASH offline adaptive tree: N_max=$MAX_TOKENS CALIB=$CALIB PORT=$PORT"
+echo "DFLASH offline adaptive tree: MODEL=$MODEL N_max=$MAX_TOKENS CALIB=$CALIB PORT=$PORT"
 
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-8B \
+    --model-path "${MODEL}" \
     --speculative-algorithm DFLASH \
-    --speculative-draft-model-path z-lab/Qwen3-8B-DFlash-b16 \
+    --speculative-draft-model-path "${DRAFT_MODEL}" \
     --speculative-num-draft-tokens 16 \
     --speculative-dflash-best-first-tokens "${MAX_TOKENS}" \
     --speculative-dflash-adaptive-tree \

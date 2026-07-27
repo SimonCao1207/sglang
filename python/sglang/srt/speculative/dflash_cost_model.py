@@ -315,6 +315,10 @@ class DFlashAdaptiveCostModel:
         self.gpu_name = gpu_name
         self.peak_flops, self.mem_bandwidth = resolve_gpu_roofline(gpu_name)
         self._buckets: Dict[int, _BucketState] = {}
+        # Ablation: when True, skip calibration entirely and select N* from the
+        # raw analytical roofline with zero fixed overhead. The controller still
+        # runs (is_ready is True), so this isolates what the startup fit buys.
+        self.raw_mode = False
 
     @classmethod
     def from_model_config(cls, model_config, gpu_name: str) -> "DFlashAdaptiveCostModel":
@@ -364,6 +368,8 @@ class DFlashAdaptiveCostModel:
 
     def fixed_overhead_s(self, batch: int) -> Optional[float]:
         """``D_B + O_B`` from the fitted sweep, or ``None`` if not yet fitted."""
+        if self.raw_mode:
+            return 0.0  # uncalibrated: no measured overhead, argmax over raw V(N)
         st = self._buckets.get(self.bucket_of(batch))
         if st is None or st.draft_s is None or st.overhead_s is None:
             return None
@@ -380,6 +386,8 @@ class DFlashAdaptiveCostModel:
 
     def is_ready(self, batch: int) -> bool:
         """True once the bucket has the constants the controller needs."""
+        if self.raw_mode:
+            return True  # raw roofline is always usable (no fit required)
         return self.fixed_overhead_s(batch) is not None
 
     # -- startup calibration fit -------------------------------------------

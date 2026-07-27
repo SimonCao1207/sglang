@@ -236,7 +236,41 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
                 "--speculative-dflash-best-first-tokens must be >= 1, "
                 f"got {verify_length}."
             )
+        tree_method = getattr(
+            server_args, "speculative_dflash_tree_method", "best_first"
+        )
+        if tree_method not in ("best_first", "beam_search"):
+            raise ValueError(
+                "--speculative-dflash-tree-method must be 'best_first' or "
+                f"'beam_search', got {tree_method!r}."
+            )
+        beam_width = getattr(server_args, "speculative_dflash_beam_width", None)
         block_size = int(server_args.speculative_num_draft_tokens)
+        if tree_method == "beam_search":
+            if server_args.speculative_dflash_adaptive_tree:
+                raise ValueError(
+                    "--speculative-dflash-tree-method=beam_search is not compatible "
+                    "with --speculative-dflash-adaptive-tree (best_first only)."
+                )
+            if beam_width is None or int(beam_width) < 1:
+                raise ValueError(
+                    "--speculative-dflash-tree-method=beam_search requires "
+                    f"--speculative-dflash-beam-width >= 1, got {beam_width}."
+                )
+            # beam_search is always full-depth, so its size comes from the width,
+            # not --best-first-tokens. Recompute so the checks below see it.
+            verify_length = 1 + int(beam_width) * max(0, block_size - 1)
+            logger.info(
+                "DFLASH beam_search: width=%d, depth=%d -> verify_length=%d nodes.",
+                int(beam_width),
+                block_size - 1,
+                verify_length,
+            )
+        elif beam_width is not None:
+            logger.warning(
+                "--speculative-dflash-beam-width is ignored unless "
+                "--speculative-dflash-tree-method=beam_search."
+            )
         # best_first picks the rank-0 chain from each depth + siblings;
         # so the tree spans at most `block_size` depths. verify_length
         # itself isn't constrained by block_size — we just need enough

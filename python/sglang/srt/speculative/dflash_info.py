@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -19,6 +19,7 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
+    sample_target_predict_per_node,
 )
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -403,14 +404,6 @@ class DFlashVerifyInput(SpecInput):
         candidates = self.draft_token.view(bs, self.draft_token_num)
 
         if self.tree_mode:
-            if (
-                sampling_info is not None
-                and not sampling_info.is_all_greedy
-            ):
-                raise NotImplementedError(
-                    "DFLASH tree-mode (best_first) verify currently only supports "
-                    "greedy sampling. Use temperature=0 or disable best_first."
-                )
             return self._verify_tree_greedy(
                 batch=batch,
                 logits_output=logits_output,
@@ -418,6 +411,7 @@ class DFlashVerifyInput(SpecInput):
                 bs=bs,
                 device=device,
                 candidates=candidates,
+                sampling_info=sampling_info,
             )
 
         if (
@@ -567,10 +561,20 @@ class DFlashVerifyInput(SpecInput):
         bs: int,
         device: torch.device,
         candidates: torch.Tensor,   # [bs, T] int (= self.draft_token reshaped)
+        sampling_info: Any = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-        """Tree-mode greedy verification using sgl_kernel.verify_tree_greedy.
+        """Tree-mode verification using sgl_kernel.verify_tree_greedy.
 
         Branched out of `verify()` to keep the chain path bitexact.
+
+        The kernel accepts a draft child iff it equals `target_predict[parent]` and
+        emits `target_predict[node]` as the committed / bonus token. For greedy
+        sampling `target_predict` is the argmax (exactly greedy decoding). For
+        non-greedy sampling it is one exact target sample per node
+        (`sample_target_predict_per_node`); because the kernel reuses that single
+        draw for both the accept test and the emitted token, tree verification is
+        distribution-preserving at temperature > 0 (SpecInfer single-sample scheme,
+        matching BASTION `tree_draft.py`).
         """
         if page_size != 1:
             raise NotImplementedError(
@@ -587,9 +591,19 @@ class DFlashVerifyInput(SpecInput):
         candidates_i64 = (
             candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
         )
-        target_predict = torch.argmax(
-            logits_output.next_token_logits, dim=-1
-        ).view(bs, tree_size)
+        # Greedy -> argmax (exactly the original path). Non-greedy -> one exact
+        # target sample per node; the kernel then yields distribution-preserving
+        # tree verification (see sample_target_predict_per_node).
+        if sampling_info is None or sampling_info.is_all_greedy:
+            target_predict = torch.argmax(
+                logits_output.next_token_logits, dim=-1
+            ).view(bs, tree_size)
+        else:
+            target_predict = sample_target_predict_per_node(
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=tree_size,
+            )
         if target_predict.dtype != torch.int64:
             target_predict = target_predict.to(torch.int64)
 
