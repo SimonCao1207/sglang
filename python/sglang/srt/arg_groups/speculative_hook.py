@@ -257,13 +257,24 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
                     "--speculative-dflash-tree-method=beam_search requires "
                     f"--speculative-dflash-beam-width >= 1, got {beam_width}."
                 )
-            # beam_search is always full-depth, so its size comes from the width,
-            # not --best-first-tokens. Recompute so the checks below see it.
-            verify_length = 1 + int(beam_width) * max(0, block_size - 1)
+            # beam_search size comes from width * depth, not --best-first-tokens.
+            # depth defaults to full (block_size - 1) but can be capped by
+            # --speculative-dflash-beam-max-depth. Recompute so the checks below
+            # see the real node count.
+            full_depth = max(0, block_size - 1)
+            user_depth = getattr(
+                server_args, "speculative_dflash_beam_max_depth", None
+            )
+            beam_depth = (
+                full_depth
+                if user_depth is None
+                else max(1, min(int(user_depth), full_depth))
+            )
+            verify_length = 1 + int(beam_width) * beam_depth
             logger.info(
                 "DFLASH beam_search: width=%d, depth=%d -> verify_length=%d nodes.",
                 int(beam_width),
-                block_size - 1,
+                beam_depth,
                 verify_length,
             )
         elif beam_width is not None:

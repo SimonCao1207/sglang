@@ -556,6 +556,7 @@ class ServerArgs:
     speculative_dflash_best_first_tokens: Optional[int] = None
     speculative_dflash_tree_method: str = "best_first"
     speculative_dflash_beam_width: Optional[int] = None
+    speculative_dflash_beam_max_depth: Optional[int] = None
     speculative_dflash_adaptive_tree: bool = False
     speculative_dflash_tree_min_tokens: Optional[int] = None
     speculative_dflash_cost_calibration_path: Optional[str] = None
@@ -5480,10 +5481,20 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-dflash-beam-width",
             type=int,
-            help="DFLASH beam_search only. Nodes kept per depth; the tree is "
-            "always full-depth, so its size is 1 + width * (block_size - 1) "
-            "and --speculative-dflash-best-first-tokens is ignored.",
+            help="DFLASH beam_search only. Nodes kept per depth. The tree size is "
+            "1 + width * depth, where depth defaults to block_size - 1 (full depth) "
+            "or --speculative-dflash-beam-max-depth if set; "
+            "--speculative-dflash-best-first-tokens is ignored.",
             default=ServerArgs.speculative_dflash_beam_width,
+        )
+        parser.add_argument(
+            "--speculative-dflash-beam-max-depth",
+            type=int,
+            help="DFLASH beam_search only. Cap the beam depth (max path length) "
+            "below the full block_size - 1. Tree size becomes 1 + width * depth. "
+            "Note: acceptance length is capped at this depth. Defaults to full "
+            "depth (block_size - 1).",
+            default=ServerArgs.speculative_dflash_beam_max_depth,
         )
         parser.add_argument(
             "--speculative-dflash-adaptive-tree",

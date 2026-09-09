@@ -247,6 +247,21 @@ class DFlashWorker:
         self.beam_width: Optional[int] = getattr(
             server_args, "speculative_dflash_beam_width", None
         )
+        # Beam depth (max path length). Defaults to full depth (block_size - 1);
+        # can be capped lower via --speculative-dflash-beam-max-depth to trade
+        # depth for width at a fixed budget (acceptance length is then capped at
+        # this depth).
+        self.beam_max_depth: Optional[int] = None
+        if self.tree_method == "beam_search" and self.beam_width is not None:
+            full_depth = self.block_size - 1
+            user_depth = getattr(
+                server_args, "speculative_dflash_beam_max_depth", None
+            )
+            self.beam_max_depth = (
+                full_depth
+                if user_depth is None
+                else max(1, min(int(user_depth), full_depth))
+            )
         if server_args.speculative_dflash_best_first_tokens is not None:
             self.best_first_verify_length = int(
                 server_args.speculative_dflash_best_first_tokens
@@ -260,7 +275,7 @@ class DFlashWorker:
                         "--speculative-dflash-beam-width."
                     )
                 self.best_first_verify_length = beam_tree_size(
-                    int(self.beam_width), self.block_size - 1
+                    int(self.beam_width), int(self.beam_max_depth)
                 )
             if int(server_args.tp_size) > 1:
                 raise NotImplementedError(
@@ -278,11 +293,15 @@ class DFlashWorker:
             if self.tp_rank == 0:
                 logger.info(
                     "DFLASH %s tree mode enabled: verify_length=%d, "
-                    "max_depth=%d (= block_size - 1). Overrode target "
+                    "max_depth=%d. Overrode target "
                     "attention backend num_draft_tokens to %d.",
                     self.tree_method,
                     self.best_first_verify_length,
-                    self.block_size - 1,
+                    (
+                        self.beam_max_depth
+                        if self.beam_max_depth is not None
+                        else self.block_size - 1
+                    ),
                     self.best_first_verify_length,
                 )
 
@@ -306,6 +325,21 @@ class DFlashWorker:
         self._forced_budget = None
         self._sweep_last = {}
         self._sweep_overhead_t0 = None
+
+        # Per-step latency breakdown (chain vs tree analysis). Off unless
+        # SGLANG_DFLASH_LATENCY_BREAKDOWN is set; when on, each decode step is
+        # split into phases (sync'd, so it perturbs absolute latency but the
+        # RELATIVE split is what matters) and the mean is logged every
+        # SGLANG_DFLASH_LATENCY_LOG_EVERY steps.
+        self._latency_bd = os.environ.get(
+            "SGLANG_DFLASH_LATENCY_BREAKDOWN", "0"
+        ).lower() not in ("0", "", "false", "no")
+        self._latency_bd_every = int(
+            os.environ.get("SGLANG_DFLASH_LATENCY_LOG_EVERY", "100")
+        )
+        self._bd_accum: dict = {}
+        self._bd_ct = 0
+        self._bd_al_sum = 0.0
         self._calib_dump_path = None
         self._calib_cost = None  # {total_ms, sweep_ms, fit_ms, points, cycles} after fit
         if self.adaptive_tree:
@@ -422,6 +456,53 @@ class DFlashWorker:
             return
         torch.cuda.synchronize(self.device)
         self._sweep_last[key] = time.perf_counter() - t0
+
+    def _bd_tic(self) -> Optional[float]:
+        """Start a latency-breakdown timer. No-op unless the breakdown is on."""
+        if not self._latency_bd:
+            return None
+        torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    def _bd_toc(self, key: str, t0: Optional[float]) -> None:
+        """Accumulate elapsed ms into `key` for the current breakdown window."""
+        if t0 is None:
+            return
+        torch.cuda.synchronize(self.device)
+        self._bd_accum[key] = self._bd_accum.get(key, 0.0) + (
+            time.perf_counter() - t0
+        ) * 1e3
+
+    def _bd_flush(self, *, bs: int, al: float) -> None:
+        """Log the mean per-phase breakdown every N steps, then reset."""
+        if not self._latency_bd:
+            return
+        self._bd_ct += 1
+        self._bd_al_sum += al
+        if self._bd_ct < self._latency_bd_every:
+            return
+        n = self._bd_ct
+        a = self._bd_accum
+        # Disjoint top-level phases sum to the step; sub-phases live inside prepare.
+        top = ("prepare", "verify_fwd", "verify_commit", "draft_update")
+        sub = ("draft_fwd", "topk", "tree_build", "tree_stack_mask",
+               "draft_sample", "prep_verify")
+        step_ms = sum(a.get(k, 0.0) for k in top) / n
+        mean_al = self._bd_al_sum / n
+        top_str = " ".join(f"{k}={a.get(k, 0.0) / n:.3f}" for k in top)
+        sub_str = " ".join(
+            f"{k}={a.get(k, 0.0) / n:.3f}" for k in sub if k in a
+        )
+        logger.info(
+            "DFLASH latency breakdown (ms/step, mean/%d, bs~%d, tree=%s): "
+            "%s | prepare-sub: %s | step=%.3f AL=%.2f => %.1f tok/s/req",
+            n, bs, self.best_first_verify_length is not None,
+            top_str, sub_str, step_ms, mean_al,
+            (mean_al / (step_ms / 1e3)) if step_ms > 0 else 0.0,
+        )
+        self._bd_accum = {}
+        self._bd_ct = 0
+        self._bd_al_sum = 0.0
 
     def _log_adaptive_cycle(self, *, stats: dict, bs: int, context_sum: int) -> None:
         """Periodic telemetry for the (now cost-model-only) budget selection."""
@@ -1095,11 +1176,13 @@ class DFlashWorker:
             )
 
             t_draft = self._sweep_tic()
+            t_bd_draft = self._bd_tic()
             with torch.inference_mode():
                 draft_logits_output = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
             self._sweep_toc("draft_s", t_draft)
+            self._bd_toc("draft_fwd", t_bd_draft)
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -1122,6 +1205,7 @@ class DFlashWorker:
             # weight (>1 GB) from HBM again for a result tree mode never reads.
             # Adaptive mode needs k = N_max candidates per depth so the heap can
             # reach the largest budget the controller might select.
+            t_topk = self._bd_tic()
             sorted_lp_flat, sorted_ids_flat = (
                 self._topk_logprobs_from_vocab_parallel_head(
                     hidden_states=draft_hidden_2d,
@@ -1129,6 +1213,7 @@ class DFlashWorker:
                     k=n_max,
                 )
             )
+            self._bd_toc("topk", t_topk)
             # Reshape to [bs, block_size - 1, k].
             depth = int(self.block_size - 1)
             k_eff = int(sorted_lp_flat.shape[-1])
@@ -1136,6 +1221,7 @@ class DFlashWorker:
             sorted_token_ids = sorted_ids_flat.view(bs, depth, k_eff)
             bonus_tokens = draft_input.bonus_tokens.to(torch.int64)
 
+            t_build = self._bd_tic()
             if self.adaptive_tree:
                 context_sum = int(batch.seq_lens_cpu.sum().item())
                 # Overhead window (tree build + stacking + mask + prepare_for_verify);
@@ -1175,14 +1261,15 @@ class DFlashWorker:
             else:
                 verify_length = n_max
                 if self.tree_method == "beam_search":
-                    # Width-pruned beam over the FULL block depth; tree size =
-                    # 1 + width*(block_size - 1) == verify_length (set at init).
+                    # Width-pruned beam; tree size = 1 + width*beam_max_depth ==
+                    # verify_length (set at init). beam_max_depth defaults to the
+                    # full block depth (block_size - 1) but may be capped lower.
                     trees = build_beam_search_trees_batched(
                         bonus_tokens=bonus_tokens,
                         sorted_logprobs=sorted_logprobs,
                         sorted_token_ids=sorted_token_ids,
                         width=int(self.beam_width),
-                        max_depth=self.block_size - 1,
+                        max_depth=int(self.beam_max_depth),
                     )
                 else:
                     trees = build_best_first_trees_batched(
@@ -1192,6 +1279,8 @@ class DFlashWorker:
                         verify_length=verify_length,
                     )
 
+            self._bd_toc("tree_build", t_build)
+
             # Stack per-request tensors. All trees have tree_size == verify_length.
             # The five index tensors ship as one [5, bs, L] buffer: each separate
             # `.to(device)` is a pageable H2D copy whose fixed cost dwarfs the
@@ -1199,6 +1288,7 @@ class DFlashWorker:
             # unbinding it yields contiguous [bs, L] tensors — verify_tree_greedy
             # requires contiguous inputs, and a [bs, 5, L] pack would only look
             # contiguous at bs == 1.
+            t_stack = self._bd_tic()
             meta_b = (
                 torch.stack(
                     [
@@ -1221,6 +1311,7 @@ class DFlashWorker:
             tree_positions_bf = (
                 target_prefix_lens.to(torch.int64).unsqueeze(1) + depths_b
             ).reshape(-1)
+            self._bd_toc("tree_stack_mask", t_stack)
 
             verify_input = DFlashVerifyInput(
                 draft_token=tokens_b.reshape(-1),
@@ -1236,6 +1327,7 @@ class DFlashWorker:
                 tree_mask_dense=tree_mask_dense_b,
             )
         else:
+            t_sample = self._bd_tic()
             draft_next = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden_2d,
                 lm_head=lm_head,
@@ -1243,6 +1335,7 @@ class DFlashWorker:
             draft_tokens = self._draft_block_tokens_buf[:bs]
             draft_tokens[:, 0].copy_(block_ids[:, 0])
             draft_tokens[:, 1:].copy_(draft_next)
+            self._bd_toc("draft_sample", t_sample)
             verify_input = DFlashVerifyInput(
                 draft_token=draft_tokens.reshape(-1),
                 positions=positions,
@@ -1257,11 +1350,13 @@ class DFlashWorker:
         # causal mask within the draft block is already correct.
         if getattr(verify_input, "tree_mode", False):
             build_custom_mask = True
+        t_prep_v = self._bd_tic()
         verify_input.prepare_for_verify(
             batch,
             self.page_size,
             build_custom_mask=build_custom_mask,
         )
+        self._bd_toc("prep_verify", t_prep_v)
 
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -1824,7 +1919,9 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
+        t_prep = self._bd_tic()
         self._prepare_for_speculative_decoding(batch, draft_input)
+        self._bd_toc("prepare", t_prep)
 
         assert batch.forward_mode.is_target_verify()
         verify_input = batch.spec_info
@@ -1840,6 +1937,7 @@ class DFlashWorker:
         # Time the verify forward only during the startup calibration sweep
         # (`_sweep_tic`/`_sweep_toc` are no-ops during serving).
         t_verify = self._sweep_tic()
+        t_vf = self._bd_tic()
         batch_result = self.target_worker.forward_batch_generation(
             batch, is_verify=True, **kwargs
         )
@@ -1848,7 +1946,9 @@ class DFlashWorker:
             batch_result.can_run_cuda_graph,
         )
         self._sweep_toc("verify_s", t_verify)
+        self._bd_toc("verify_fwd", t_vf)
 
+        t_vc = self._bd_tic()
         (
             new_bonus_tokens,
             commit_lens,
@@ -1859,6 +1959,7 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+        self._bd_toc("verify_commit", t_vc)
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1869,14 +1970,21 @@ class DFlashWorker:
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
+        t_du = self._bd_tic()
         draft_input.bonus_tokens = new_bonus_tokens
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
         self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
+        self._bd_toc("draft_update", t_du)
 
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
+        if self._latency_bd and num_correct_drafts_per_req_cpu:
+            self._bd_flush(
+                bs=len(num_correct_drafts_per_req_cpu),
+                al=num_correct_drafts / len(num_correct_drafts_per_req_cpu) + 1.0,
+            )
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
                 "DFLASH verify completed. num_correct_drafts_per_req=%s",
