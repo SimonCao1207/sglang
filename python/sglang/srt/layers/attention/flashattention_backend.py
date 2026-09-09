@@ -372,7 +372,12 @@ class FlashAttentionBackend(AttentionBackend):
             # TODO: we need to test this part for llama 4 eagle case
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
-            if self.topk <= 1:
+            # `self.topk` is set from server_args.speculative_eagle_topk at init
+            # and stays at 1 for DFLASH (forced). DFLASH best_first uses a real
+            # tree per verify step and signals that via spec_info.topk =
+            # verify_length (> 1). Either signal puts us on the tree path that
+            # consumes spec_info.custom_mask.
+            if not self._verify_is_tree(forward_batch.spec_info):
                 metadata.cache_seqlens_int32 = (
                     forward_batch.seq_lens + self.speculative_num_draft_tokens
                 ).to(torch.int32)
@@ -699,9 +704,11 @@ class FlashAttentionBackend(AttentionBackend):
         # We don't use cascade attention for Sliding Window Attention:
         # - Different window sizes should be passed in for each q in the first stage of cascade attention, but FA3 interface doesn't support pass in a list of window sizes.
         # - The overhead of duplicated computation of the common prefix part is small for sliding window layers (seq_len <= window_size), so we can just expand it.
+        # DFLASH best_first signals tree verify via spec_info.topk > 1 even though
+        # speculative_eagle_topk (and thus self.topk) is forced to 1 for DFLASH.
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
-            and self.topk > 1
+            and self._verify_is_tree(forward_batch.spec_info)
             and not is_swa_layer
         )
 
@@ -1529,7 +1536,7 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 )
 
-        if self.topk > 1:
+        if self._maybe_tree_verify:
             self.target_verify_metadata_topk_normal = {
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -1622,6 +1629,36 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             # For decoder-only models, skip encoder_metadata allocation
             self.encoder_metadata = {}
+
+    @property
+    def _maybe_tree_verify(self) -> bool:
+        """Whether this backend may ever see a tree target-verify batch.
+
+        Used to decide which CUDA-graph metadata buffers to allocate. It cannot
+        depend on `spec_info`: buffers are allocated at capture time, and for
+        DFLASH the worker only announces best_first *after* the target model has
+        already captured its graphs. server_args is the one signal available
+        that early.
+        """
+        if self.topk > 1:
+            return True
+        best_first = getattr(
+            get_global_server_args(), "speculative_dflash_best_first_tokens", None
+        )
+        return best_first is not None and int(best_first) > 1
+
+    def _verify_is_tree(self, spec_info) -> bool:
+        """Whether target verify must take the tree (cascade) path.
+
+        EAGLE signals a tree through `self.topk` (= speculative_eagle_topk).
+        DFLASH best_first forces that to 1 and signals through `spec_info.topk`
+        instead, so both have to be consulted — capture, replay and forward must
+        agree or a tree batch gets chain metadata.
+        """
+        if self.topk > 1:
+            return True
+        spec_info_topk = getattr(spec_info, "topk", None) if spec_info is not None else None
+        return spec_info_topk is not None and spec_info_topk > 1
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1750,7 +1787,7 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.scheduler_metadata = self._sched_meta_buf[:n]
 
         elif forward_mode.is_target_verify():
-            if self.topk <= 1:
+            if not self._verify_is_tree(spec_info):
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
@@ -2033,7 +2070,7 @@ class FlashAttentionBackend(AttentionBackend):
                         self._sched_meta_buf[n:] = 0
 
         elif forward_mode.is_target_verify():
-            if self.topk <= 1:
+            if not self._verify_is_tree(spec_info):
                 metadata = self.target_verify_metadata[bs]
                 metadata.cache_seqlens_int32.copy_(
                     (seq_lens + self.speculative_num_draft_tokens)

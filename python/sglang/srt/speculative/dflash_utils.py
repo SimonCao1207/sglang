@@ -639,6 +639,63 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
+def sample_target_predict_per_node(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Per-node target posterior for non-greedy tree verification.
+
+    This is the tree generalization of the DFlash chain step
+    ``posterior = sample(output.logits, temperature)`` (``dflash/model.py``): the
+    target forward already produced next-token logits at every tree node, so we draw
+    ONE posterior token per node with ``softmax(logits / T)`` + ``multinomial`` and
+    return it shaped ``[bs, draft_token_num]``. Fed to ``verify_tree_greedy`` as
+    ``target_predict`` the kernel accepts a draft child iff it equals its parent's
+    posterior and emits that same posterior as the committed / bonus token; the
+    single draw is reused for both, so verification is distribution-preserving at
+    temperature > 0 and uses the exact acceptance rule of the DFlash / BASTION
+    baseline (accept iff draft equals the target's own sample).
+
+    A tree needs a posterior at every node because of branching, so all nodes are
+    sampled; a chain is just the special case where every position lies on the single
+    path (as in ``dflash_generate``). Temperature-only, matching the ``sample()``
+    baseline. Sampling is chunked over rows so we never materialize a full
+    ``[bs * draft_token_num, vocab]`` probability tensor, which OOMs at server batch
+    sizes when the tree verify has already consumed most of the KV budget. Callers
+    use argmax directly when the whole batch is greedy.
+    """
+    if next_token_logits.ndim != 2:
+        raise ValueError(
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
+        )
+    total_rows, vocab_size = next_token_logits.shape
+    if draft_token_num <= 0:
+        raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
+    if total_rows % draft_token_num != 0:
+        raise ValueError(
+            "next_token_logits row count is not a multiple of draft_token_num: "
+            f"{total_rows} vs {draft_token_num}."
+        )
+    bs = total_rows // draft_token_num
+
+    # posterior = sample(logits, T): softmax(logits / T) then one draw per node.
+    expanded_temperature = torch.repeat_interleave(
+        sampling_info.temperatures, draft_token_num, dim=0
+    )
+    chunk = max(1, (1 << 24) // vocab_size)
+    sampled = torch.empty(
+        total_rows, dtype=torch.long, device=next_token_logits.device
+    )
+    for i in range(0, total_rows, chunk):
+        scaled = next_token_logits[i : i + chunk] / expanded_temperature[i : i + chunk]
+        probs = torch.softmax(scaled.float(), dim=-1)
+        sampled[i : i + chunk] = torch.multinomial(probs, num_samples=1).squeeze(1)
+    return sampled.view(bs, draft_token_num).to(torch.int64)
+
+
 def validate_dflash_request(req: Req) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."

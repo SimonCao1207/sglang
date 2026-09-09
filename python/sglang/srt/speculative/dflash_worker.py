@@ -1,5 +1,7 @@
 import logging
 import math
+import os
+import time
 from copy import deepcopy
 from typing import Optional
 
@@ -21,6 +23,13 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
+from sglang.srt.speculative.dflash_tree_builder import (
+    beam_tree_size,
+    build_adaptive_best_first_trees_batched,
+    build_beam_search_trees_batched,
+    build_best_first_trees_batched,
+    build_tree_mask_dense,
+)
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     is_dflash_sampling_verify_available,
@@ -230,6 +239,517 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+        self.best_first_verify_length: Optional[int] = None
+        self.tree_method: str = getattr(
+            server_args, "speculative_dflash_tree_method", "best_first"
+        )
+        self.beam_width: Optional[int] = getattr(
+            server_args, "speculative_dflash_beam_width", None
+        )
+        # Beam depth (max path length). Defaults to full depth (block_size - 1);
+        # can be capped lower via --speculative-dflash-beam-max-depth to trade
+        # depth for width at a fixed budget (acceptance length is then capped at
+        # this depth).
+        self.beam_max_depth: Optional[int] = None
+        if self.tree_method == "beam_search" and self.beam_width is not None:
+            full_depth = self.block_size - 1
+            user_depth = getattr(
+                server_args, "speculative_dflash_beam_max_depth", None
+            )
+            self.beam_max_depth = (
+                full_depth
+                if user_depth is None
+                else max(1, min(int(user_depth), full_depth))
+            )
+        if server_args.speculative_dflash_best_first_tokens is not None:
+            self.best_first_verify_length = int(
+                server_args.speculative_dflash_best_first_tokens
+            )
+            if self.tree_method == "beam_search":
+                # beam_search is always full-depth, so its size comes from the
+                # width, not --best-first-tokens.
+                if self.beam_width is None:
+                    raise ValueError(
+                        "--speculative-dflash-tree-method=beam_search requires "
+                        "--speculative-dflash-beam-width."
+                    )
+                self.best_first_verify_length = beam_tree_size(
+                    int(self.beam_width), int(self.beam_max_depth)
+                )
+            if int(server_args.tp_size) > 1:
+                raise NotImplementedError(
+                    "DFLASH best_first does not yet support tp_size > 1 "
+                    "(top-k over the LM head is not TP-fused yet)."
+                )
+
+            # Verify backends size their metadata from a draft-token count
+            # captured at init (= block_size). With a tree we need tree_size
+            # instead; in adaptive mode this is the upper bound N_max and the
+            # controller re-sets it to the per-step budget N* each cycle via
+            # `_set_target_draft_token_count`.
+            self._set_target_draft_token_count(self.best_first_verify_length)
+
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH %s tree mode enabled: verify_length=%d, "
+                    "max_depth=%d. Overrode target "
+                    "attention backend num_draft_tokens to %d.",
+                    self.tree_method,
+                    self.best_first_verify_length,
+                    (
+                        self.beam_max_depth
+                        if self.beam_max_depth is not None
+                        else self.block_size - 1
+                    ),
+                    self.best_first_verify_length,
+                )
+
+        # Adaptive shared-budget controller (opt-in). Treats best_first_tokens as
+        # N_max and picks N* in [min_budget, N_max] per batched cycle using a cost
+        # model calibrated ONCE at startup: a BASTION-style affine roofline fit
+        # over a synthetic verify sweep on the real kernels. After the fit the
+        # model is fixed, so N* is deterministic with no per-step measurement.
+        # See dflash_cost_model.py.
+        self.adaptive_tree = bool(
+            getattr(server_args, "speculative_dflash_adaptive_tree", False)
+        )
+        self.adaptive_min_budget = 1
+        self.adaptive_cost_model = None
+        self._adaptive_step_ct = 0
+        self._adaptive_log_every = 200
+        # Startup-sweep state. `_sweeping` gates one-shot calibration timing (no
+        # serving overhead); `_forced_budget` pins the tree size during the sweep;
+        # `_sweep_last` collects the timed stages of the current cycle.
+        self._sweeping = False
+        self._forced_budget = None
+        self._sweep_last = {}
+        self._sweep_overhead_t0 = None
+
+        # Per-step latency breakdown (chain vs tree analysis). Off unless
+        # SGLANG_DFLASH_LATENCY_BREAKDOWN is set; when on, each decode step is
+        # split into phases (sync'd, so it perturbs absolute latency but the
+        # RELATIVE split is what matters) and the mean is logged every
+        # SGLANG_DFLASH_LATENCY_LOG_EVERY steps.
+        self._latency_bd = os.environ.get(
+            "SGLANG_DFLASH_LATENCY_BREAKDOWN", "0"
+        ).lower() not in ("0", "", "false", "no")
+        self._latency_bd_every = int(
+            os.environ.get("SGLANG_DFLASH_LATENCY_LOG_EVERY", "100")
+        )
+        self._bd_accum: dict = {}
+        self._bd_ct = 0
+        self._bd_al_sum = 0.0
+        self._calib_dump_path = None
+        self._calib_cost = None  # {total_ms, sweep_ms, fit_ms, points, cycles} after fit
+        if self.adaptive_tree:
+            if self.best_first_verify_length is None:
+                raise ValueError(
+                    "--speculative-dflash-adaptive-tree requires "
+                    "--speculative-dflash-best-first-tokens (the budget upper bound N_max)."
+                )
+            min_tokens = getattr(
+                server_args, "speculative_dflash_tree_min_tokens", None
+            )
+            self.adaptive_min_budget = max(1, int(min_tokens) if min_tokens else 1)
+            # Telemetry cadence: log the first few cycles, then every Nth.
+            self._adaptive_log_every = max(
+                1, int(os.environ.get("SGLANG_DFLASH_ADAPTIVE_LOG_EVERY", "200"))
+            )
+            if self.adaptive_min_budget > int(self.best_first_verify_length):
+                raise ValueError(
+                    "speculative_dflash_tree_min_tokens "
+                    f"({self.adaptive_min_budget}) must be <= best_first_tokens "
+                    f"({self.best_first_verify_length})."
+                )
+            from sglang.srt.speculative.dflash_cost_model import (
+                DFlashAdaptiveCostModel,
+            )
+
+            try:
+                gpu_name = torch.cuda.get_device_name(self.device)
+            except Exception:
+                gpu_name = "a100"
+            self.adaptive_cost_model = DFlashAdaptiveCostModel.from_model_config(
+                self.model_runner.model_config, gpu_name
+            )
+            # Optional: dump the fitted calibration here for inspection / records.
+            self._calib_dump_path = getattr(
+                server_args, "speculative_dflash_cost_calibration_path", None
+            )
+            # Calibration mode for the calibration ablation. 'fit' (default) runs the
+            # startup sweep and fits the affine roofline; 'raw' skips it and selects
+            # N* from the raw analytical roofline (uncalibrated). Env-toggled so an
+            # A/B run needs no code change: SGLANG_DFLASH_CALIB_MODE=raw|fit.
+            self._calib_mode = (
+                os.environ.get("SGLANG_DFLASH_CALIB_MODE", "fit").strip().lower()
+            )
+
+            if self._calib_mode == "raw":
+                self.adaptive_cost_model.raw_mode = True
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH adaptive tree enabled: N_max=%d, min_budget=%d, gpu=%s, "
+                        "calibration=RAW (uncalibrated). Skipping the startup sweep; N* "
+                        "is chosen from the analytical roofline with zero fixed overhead.",
+                        self.best_first_verify_length,
+                        self.adaptive_min_budget,
+                        gpu_name,
+                    )
+            else:
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH adaptive tree enabled: N_max=%d, min_budget=%d, gpu=%s, "
+                        "calibration=FIT. Calibrating the verify cost model at startup...",
+                        self.best_first_verify_length,
+                        self.adaptive_min_budget,
+                        gpu_name,
+                    )
+                # One-shot calibration on the real verify kernels, then serve frozen.
+                self._run_startup_calibration_sweep()
+                if self._calib_dump_path and self.tp_rank == 0:
+                    try:
+                        self.adaptive_cost_model.dump_calibration(self._calib_dump_path)
+                        logger.info(
+                            "DFLASH dumped fitted calibration to %s.",
+                            self._calib_dump_path,
+                        )
+                    except Exception as e:
+                        logger.warning("DFLASH calibration dump failed: %s", e)
+
+    def _set_target_draft_token_count(self, n: int) -> None:
+        """Point the target verify attention backends at a tree size of `n`.
+
+        Backends size verify metadata from a fixed draft-token attribute
+        (`num_draft_tokens` on triton, `speculative_num_draft_tokens` on FA3/FA4).
+        Adaptive mode calls this each step with the selected budget N*; the eager
+        verify path (tree mode disables CUDA graph) rebuilds metadata per forward,
+        so a plain attribute update takes effect on the next verify.
+        """
+        n = int(n)
+        attrs = ("num_draft_tokens", "speculative_num_draft_tokens")
+        backends = [getattr(self.model_runner, "attn_backend", None)]
+        for name in ("prefill_attn_backend", "decode_attn_backend"):
+            backends.append(getattr(self.model_runner, name, None))
+        for backend in backends:
+            if backend is None:
+                continue
+            for attr in attrs:
+                if hasattr(backend, attr):
+                    setattr(backend, attr, n)
+
+    def _sweep_tic(self) -> Optional[float]:
+        """Start a wall-clock timer for one stage, only during the startup sweep.
+
+        Syncs the device first so the measured window excludes prior async GPU
+        work. Returns None (a no-op) during normal serving, so the serving hot
+        path pays nothing.
+        """
+        if not self._sweeping:
+            return None
+        torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    def _sweep_toc(self, key: str, t0: Optional[float]) -> None:
+        """Close a `_sweep_tic` window and record the elapsed seconds."""
+        if not self._sweeping or t0 is None:
+            return
+        torch.cuda.synchronize(self.device)
+        self._sweep_last[key] = time.perf_counter() - t0
+
+    def _bd_tic(self) -> Optional[float]:
+        """Start a latency-breakdown timer. No-op unless the breakdown is on."""
+        if not self._latency_bd:
+            return None
+        torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    def _bd_toc(self, key: str, t0: Optional[float]) -> None:
+        """Accumulate elapsed ms into `key` for the current breakdown window."""
+        if t0 is None:
+            return
+        torch.cuda.synchronize(self.device)
+        self._bd_accum[key] = self._bd_accum.get(key, 0.0) + (
+            time.perf_counter() - t0
+        ) * 1e3
+
+    def _bd_flush(self, *, bs: int, al: float) -> None:
+        """Log the mean per-phase breakdown every N steps, then reset."""
+        if not self._latency_bd:
+            return
+        self._bd_ct += 1
+        self._bd_al_sum += al
+        if self._bd_ct < self._latency_bd_every:
+            return
+        n = self._bd_ct
+        a = self._bd_accum
+        # Disjoint top-level phases sum to the step; sub-phases live inside prepare.
+        top = ("prepare", "verify_fwd", "verify_commit", "draft_update")
+        sub = ("draft_fwd", "topk", "tree_build", "tree_stack_mask",
+               "draft_sample", "prep_verify")
+        step_ms = sum(a.get(k, 0.0) for k in top) / n
+        mean_al = self._bd_al_sum / n
+        top_str = " ".join(f"{k}={a.get(k, 0.0) / n:.3f}" for k in top)
+        sub_str = " ".join(
+            f"{k}={a.get(k, 0.0) / n:.3f}" for k in sub if k in a
+        )
+        logger.info(
+            "DFLASH latency breakdown (ms/step, mean/%d, bs~%d, tree=%s): "
+            "%s | prepare-sub: %s | step=%.3f AL=%.2f => %.1f tok/s/req",
+            n, bs, self.best_first_verify_length is not None,
+            top_str, sub_str, step_ms, mean_al,
+            (mean_al / (step_ms / 1e3)) if step_ms > 0 else 0.0,
+        )
+        self._bd_accum = {}
+        self._bd_ct = 0
+        self._bd_al_sum = 0.0
+
+    def _log_adaptive_cycle(self, *, stats: dict, bs: int, context_sum: int) -> None:
+        """Periodic telemetry for the (now cost-model-only) budget selection."""
+        if self.tp_rank != 0:
+            return
+        if not (
+            self._adaptive_step_ct <= 3
+            or self._adaptive_step_ct % self._adaptive_log_every == 0
+        ):
+            return
+        logger.info(
+            "DFLASH adaptive cycle #%d: N*=%d/%d (reachable=%d) bs=%d ctx_sum=%d "
+            "avg_accept=%.2f est_speedup=%s",
+            self._adaptive_step_ct,
+            stats.get("budget", -1),
+            stats.get("max_budget", -1),
+            stats.get("reachable", -1),
+            bs,
+            context_sum,
+            stats.get("avg_accept", float("nan")),
+            f"{stats['est_speedup']:.2f}" if "est_speedup" in stats else "n/a",
+        )
+
+    # -- one-shot startup calibration --------------------------------------
+    def _run_startup_calibration_sweep(self) -> None:
+        """Calibrate the cost model once, on the real verify kernels, before serving.
+
+        Drives synthetic decode cycles through the real DFlash prefill -> draft ->
+        verify path over a coarse ``(batch, tree_size)`` grid, timing the
+        draft/verify/overhead stages on the actual attention backend, then fits a
+        BASTION-style affine roofline per batch-size bucket
+        (:meth:`DFlashAdaptiveCostModel.fit_from_samples`). Each grid point uses a
+        fresh prefill so there is no inter-cycle KV drift. The fitted model is then
+        fixed, so ``N*`` is deterministic with zero per-step measurement cost.
+
+        Every failure mode degrades gracefully: a bad grid point is skipped, and a
+        wholly failed sweep leaves the uncalibrated analytical roofline in place
+        (the server still runs, just with a less accurate ``N*``).
+        """
+        import numpy as np
+
+        from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+        from sglang.srt.sampling.sampling_params import SamplingParams
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        # Minimal no-op tree cache for standalone allocation (mirrors the dummy in
+        # bench_one_batch): no prefix caching, just KV allocation.
+        class _DummyTreeCache:
+            page_size = self.model_runner.server_args.page_size
+            device = self.model_runner.device
+            token_to_kv_pool_allocator = self.model_runner.token_to_kv_pool_allocator
+
+            def supports_swa(self):
+                return False
+
+            def supports_mamba(self):
+                return False
+
+            def is_chunk_cache(self):
+                return False
+
+            def is_tree_cache(self):
+                return True
+
+            def evict(self, *args, **kwargs):
+                pass
+
+        n_max = int(self.best_first_verify_length)
+        max_batch = max(1, int(os.environ.get("SGLANG_DFLASH_CALIB_MAX_BATCH", "32")))
+        context_len = max(
+            16, int(os.environ.get("SGLANG_DFLASH_CALIB_CONTEXT", "2048"))
+        )
+        # Cap total prefill tokens per grid point so large batches don't blow the
+        # KV pool: per-request context shrinks as batch grows (bs*ctx <= budget).
+        # An over-large batch otherwise exhausts the allocator (alloc returns None,
+        # surfacing as odd "int > None" errors) or OOMs the hidden-state capture.
+        # Bound to a safe fraction of the real pool capacity, leaving headroom for
+        # the draft KV + the verify tree tokens.
+        pool_cap = int(getattr(self.model_runner, "max_total_num_tokens", 0) or 0)
+        token_budget_default = min(8192, int(0.4 * pool_cap)) if pool_cap else 8192
+        max_sweep_tokens = max(
+            256,
+            int(os.environ.get("SGLANG_DFLASH_CALIB_MAX_TOKENS", str(token_budget_default))),
+        )
+        warmup_repeats = int(os.environ.get("SGLANG_DFLASH_CALIB_WARMUP", "1"))
+        measure_repeats = max(1, int(os.environ.get("SGLANG_DFLASH_CALIB_REPEATS", "2")))
+
+        batch_grid = [b for b in (1, 2, 4, 8, 16, 32) if b <= max_batch]
+        tree_grid = sorted(
+            n
+            for n in {1, 2, 4, 8, 16, 32, self.adaptive_min_budget, n_max}
+            if 1 <= n <= n_max
+        )
+        vocab = int(self.model_runner.model_config.vocab_size)
+        hi = min(vocab, 10000)
+
+        def _clear_pools() -> None:
+            for mr in (self.model_runner, self.draft_model_runner):
+                for pool_name in ("req_to_token_pool", "token_to_kv_pool_allocator"):
+                    pool = getattr(mr, pool_name, None)
+                    if pool is not None and hasattr(pool, "clear"):
+                        try:
+                            pool.clear()
+                        except Exception:
+                            pass
+
+        def _one_cycle(bs: int, budget: int, ctx_len: int) -> dict:
+            """Fresh prefill + a single forced-budget verify; returns timed stages."""
+            _clear_pools()
+            reqs = []
+            for i in range(bs):
+                ids = np.random.randint(0, hi, size=ctx_len).astype(int).tolist()
+                # Greedy sampling (tree verify is greedy-only) + normalize() so the
+                # real serving-path fields (stop_strs, top_k=1, ...) are populated.
+                sp = SamplingParams(
+                    temperature=0.0, top_k=1, top_p=1.0, max_new_tokens=4
+                )
+                sp.normalize(None)
+                req = Req(
+                    rid=f"dflash-calib-{bs}-{i}",
+                    origin_input_text="",
+                    origin_input_ids=ids,
+                    sampling_params=sp,
+                    vocab_size=vocab,  # verify/commit path checks token_id > vocab
+                )
+                req.fill_ids = req.origin_input_ids
+                req.logprob_start_len = -1
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                reqs.append(req)
+
+            batch = ScheduleBatch.init_new(
+                reqs=reqs,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+                tree_cache=_DummyTreeCache(),
+                model_config=self.model_runner.model_config,
+                enable_overlap=False,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            )
+            batch.prepare_for_extend()
+            self.forward_batch_generation(batch)  # prefill -> draft_input on spec_info
+
+            self._forced_budget = int(budget)
+            batch.output_ids = batch.spec_info.bonus_tokens
+            batch.prepare_for_decode()
+            self._sweep_last = {}
+            self.forward_batch_generation(batch)  # draft + verify at forced budget
+            return dict(self._sweep_last)
+
+        import traceback as _tb
+
+        samples: list = []
+        n_points = 0   # (batch, tree_size) grid points attempted
+        n_cycles = 0   # total prefill->draft->verify cycles run (warmup + measured)
+        # Sync so the measured wall-clock reflects only the sweep, not pending
+        # model-load/warmup work already queued on the device.
+        torch.cuda.synchronize(self.device)
+        t_start = time.perf_counter()
+        self._sweeping = True
+        try:
+            for bs in batch_grid:
+                # Shrink per-request context for large batches to stay in the pool.
+                ctx_len = max(128, min(context_len, max_sweep_tokens // bs))
+                for budget in tree_grid:
+                    n_points += 1
+                    best: Optional[dict] = None
+                    for rep in range(warmup_repeats + measure_repeats):
+                        try:
+                            timed = _one_cycle(bs, budget, ctx_len)
+                            n_cycles += 1
+                        except Exception as e:
+                            frames = _tb.extract_tb(e.__traceback__)
+                            loc = (
+                                f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}"
+                                if frames
+                                else "?"
+                            )
+                            logger.warning(
+                                "DFLASH calib sweep point bs=%d N=%d rep=%d failed at "
+                                "%s: %r",
+                                bs, budget, rep, loc, e,
+                            )
+                            best = None
+                            break
+                        if rep < warmup_repeats:
+                            continue
+                        v = timed.get("verify_s")
+                        if v and v > 0 and (best is None or v < best["verify_s"]):
+                            best = timed
+                    if best and best.get("verify_s"):
+                        samples.append(
+                            dict(
+                                batch=bs,
+                                tree_size=budget,
+                                context_sum=bs * ctx_len,
+                                verify_s=best.get("verify_s"),
+                                draft_s=best.get("draft_s"),
+                                overhead_s=best.get("overhead_s"),
+                            )
+                        )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("DFLASH calibration sweep aborted: %s", e)
+        finally:
+            self._sweeping = False
+            self._forced_budget = None
+            self._sweep_last = {}
+            try:
+                _clear_pools()
+            except Exception:
+                pass
+        torch.cuda.synchronize(self.device)
+        sweep_ms = (time.perf_counter() - t_start) * 1e3
+
+        if not samples:
+            logger.warning(
+                "DFLASH calibration sweep produced no samples; serving with the "
+                "uncalibrated analytical roofline (N* selection may be less accurate)."
+            )
+            return
+        t_fit = time.perf_counter()
+        summary = self.adaptive_cost_model.fit_from_samples(samples)
+        fit_ms = (time.perf_counter() - t_fit) * 1e3
+        # Record so the cost can be embedded in the dumped calibration / cited.
+        self._calib_cost = {
+            "total_ms": sweep_ms + fit_ms,
+            "sweep_ms": sweep_ms,
+            "fit_ms": fit_ms,
+            "points": n_points,
+            "cycles": n_cycles,
+            "ms_per_cycle": (sweep_ms / n_cycles) if n_cycles else None,
+        }
+        if self.tp_rank == 0:
+            logger.info(
+                "DFLASH calibration added %.0fms to startup: sweep=%.0fms "
+                "(%d points, %d cycles, %.1fms/cycle) + fit=%.1fms. "
+                "batch=%s tree=%s ctx<=%d buckets=%s",
+                sweep_ms + fit_ms,
+                sweep_ms,
+                n_points,
+                n_cycles,
+                (sweep_ms / n_cycles) if n_cycles else float("nan"),
+                fit_ms,
+                batch_grid,
+                tree_grid,
+                context_len,
+                dict(sorted(summary.items())),
+            )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -655,10 +1175,14 @@ class DFlashWorker:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
+            t_draft = self._sweep_tic()
+            t_bd_draft = self._bd_tic()
             with torch.inference_mode():
                 draft_logits_output = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
+            self._sweep_toc("draft_s", t_draft)
+            self._bd_toc("draft_fwd", t_bd_draft)
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -667,28 +1191,172 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+        # Draft distributions live at depths 1..block_size-1.
+        draft_hidden_2d = draft_hidden[:, 1:, :].reshape(
+            -1, draft_hidden.shape[-1]
+        )  # [bs * (block_size - 1), hidden]
         positions = positions_2d.reshape(-1)
 
-        verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
-        )
+        if self.best_first_verify_length is not None:
+            n_max = int(self.best_first_verify_length)
+            # Per-depth top-k draft sampling (TP=1; tp_size > 1 was rejected in __init__).
+            # No greedy pass here: the chain-mode argmax is just rank 0 of this
+            # top-k, and a second projection would stream the whole lm_head
+            # weight (>1 GB) from HBM again for a result tree mode never reads.
+            # Adaptive mode needs k = N_max candidates per depth so the heap can
+            # reach the largest budget the controller might select.
+            t_topk = self._bd_tic()
+            sorted_lp_flat, sorted_ids_flat = (
+                self._topk_logprobs_from_vocab_parallel_head(
+                    hidden_states=draft_hidden_2d,
+                    lm_head=lm_head,
+                    k=n_max,
+                )
+            )
+            self._bd_toc("topk", t_topk)
+            # Reshape to [bs, block_size - 1, k].
+            depth = int(self.block_size - 1)
+            k_eff = int(sorted_lp_flat.shape[-1])
+            sorted_logprobs = sorted_lp_flat.view(bs, depth, k_eff)
+            sorted_token_ids = sorted_ids_flat.view(bs, depth, k_eff)
+            bonus_tokens = draft_input.bonus_tokens.to(torch.int64)
+
+            t_build = self._bd_tic()
+            if self.adaptive_tree:
+                context_sum = int(batch.seq_lens_cpu.sum().item())
+                # Overhead window (tree build + stacking + mask + prepare_for_verify);
+                # closed after prepare_for_verify. Only timed during the sweep.
+                self._sweep_overhead_t0 = self._sweep_tic()
+                if self._forced_budget is not None:
+                    # Startup calibration pins the tree size to time verify at a
+                    # known N (bypasses the controller).
+                    verify_length = int(self._forced_budget)
+                    trees = build_best_first_trees_batched(
+                        bonus_tokens=bonus_tokens,
+                        sorted_logprobs=sorted_logprobs,
+                        sorted_token_ids=sorted_token_ids,
+                        verify_length=verify_length,
+                    )
+                    tree_stats = {"budget": verify_length, "max_budget": n_max}
+                else:
+                    # Controller picks one shared budget N* <= N_max for the batch.
+                    trees, verify_length, tree_stats = (
+                        build_adaptive_best_first_trees_batched(
+                            bonus_tokens=bonus_tokens,
+                            sorted_logprobs=sorted_logprobs,
+                            sorted_token_ids=sorted_token_ids,
+                            max_budget=n_max,
+                            min_budget=self.adaptive_min_budget,
+                            cost_model=self.adaptive_cost_model,
+                            context_sum=context_sum,
+                        )
+                    )
+                # Re-point the verify attention backends at the chosen budget N*.
+                self._set_target_draft_token_count(verify_length)
+                self._adaptive_step_ct += 1
+                if not self._sweeping:
+                    self._log_adaptive_cycle(
+                        stats=tree_stats, bs=bs, context_sum=context_sum
+                    )
+            else:
+                verify_length = n_max
+                if self.tree_method == "beam_search":
+                    # Width-pruned beam; tree size = 1 + width*beam_max_depth ==
+                    # verify_length (set at init). beam_max_depth defaults to the
+                    # full block depth (block_size - 1) but may be capped lower.
+                    trees = build_beam_search_trees_batched(
+                        bonus_tokens=bonus_tokens,
+                        sorted_logprobs=sorted_logprobs,
+                        sorted_token_ids=sorted_token_ids,
+                        width=int(self.beam_width),
+                        max_depth=int(self.beam_max_depth),
+                    )
+                else:
+                    trees = build_best_first_trees_batched(
+                        bonus_tokens=bonus_tokens,
+                        sorted_logprobs=sorted_logprobs,
+                        sorted_token_ids=sorted_token_ids,
+                        verify_length=verify_length,
+                    )
+
+            self._bd_toc("tree_build", t_build)
+
+            # Stack per-request tensors. All trees have tree_size == verify_length.
+            # The five index tensors ship as one [5, bs, L] buffer: each separate
+            # `.to(device)` is a pageable H2D copy whose fixed cost dwarfs the
+            # few hundred bytes it moves. The field axis must lead so that
+            # unbinding it yields contiguous [bs, L] tensors — verify_tree_greedy
+            # requires contiguous inputs, and a [bs, 5, L] pack would only look
+            # contiguous at bs == 1.
+            t_stack = self._bd_tic()
+            meta_b = (
+                torch.stack(
+                    [
+                        torch.stack([t.tokens for t in trees]),
+                        torch.stack([t.parent_indices for t in trees]),
+                        torch.stack([t.depths for t in trees]),
+                        torch.stack([t.first_child for t in trees]),
+                        torch.stack([t.next_sibling for t in trees]),
+                    ]
+                )
+                .to(self.device, non_blocking=True)
+                .unbind(0)
+            )
+            tokens_b, parents_b, depths_b, first_child_b, next_sibling_b = meta_b
+            tree_mask_dense_b = torch.stack(
+                [build_tree_mask_dense(t.parent_indices.tolist()) for t in trees]
+            ).to(self.device, non_blocking=True)
+
+            retrieve_index_bf = self._get_tree_retrieve_index(bs, verify_length)
+            tree_positions_bf = (
+                target_prefix_lens.to(torch.int64).unsqueeze(1) + depths_b
+            ).reshape(-1)
+            self._bd_toc("tree_stack_mask", t_stack)
+
+            verify_input = DFlashVerifyInput(
+                draft_token=tokens_b.reshape(-1),
+                positions=tree_positions_bf,
+                draft_token_num=verify_length,
+                topk=verify_length,
+                retrieve_index=retrieve_index_bf,
+                retrieve_next_token=first_child_b,
+                retrieve_next_sibling=next_sibling_b,
+                parent_indices=parents_b[0],
+                depths=depths_b[0],
+                tree_mode=True,
+                tree_mask_dense=tree_mask_dense_b,
+            )
+        else:
+            t_sample = self._bd_tic()
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden_2d,
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
+            draft_tokens = self._draft_block_tokens_buf[:bs]
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
+            self._bd_toc("draft_sample", t_sample)
+            verify_input = DFlashVerifyInput(
+                draft_token=draft_tokens.reshape(-1),
+                positions=positions,
+                draft_token_num=self.block_size,
+            )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
         )
+        # Tree-mode verify always needs the dense custom_mask: the attention
+        # backend (triton or FA) consumes it to encode ancestor-only access.
+        # The skip list applies only to chain-mode verify, where the implicit
+        # causal mask within the draft block is already correct.
+        if getattr(verify_input, "tree_mode", False):
+            build_custom_mask = True
+        t_prep_v = self._bd_tic()
         verify_input.prepare_for_verify(
             batch,
             self.page_size,
             build_custom_mask=build_custom_mask,
         )
+        self._bd_toc("prep_verify", t_prep_v)
 
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -697,6 +1365,83 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+
+        # Close the non-verify overhead window (tree build + stacking + mask +
+        # allocation). Only measured during the startup calibration sweep.
+        if self.adaptive_tree and self._sweeping:
+            self._sweep_toc("overhead_s", self._sweep_overhead_t0)
+            self._sweep_overhead_t0 = None
+
+    def _get_tree_retrieve_index(self, bs: int, verify_length: int) -> torch.Tensor:
+        """Cached `arange(bs * L).view(bs, L)` for tree verify.
+
+        The values only ever depend on (bs, L), so grow one buffer and slice it
+        rather than launching a fresh arange every verify step.
+        """
+        buf = getattr(self, "_tree_retrieve_index_buf", None)
+        need = bs * verify_length
+        if buf is None or buf.numel() < need:
+            buf = torch.arange(need, dtype=torch.int64, device=self.device)
+            self._tree_retrieve_index_buf = buf
+        return buf[:need].view(bs, verify_length)
+
+    def _topk_logprobs_from_vocab_parallel_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,  # [N, hidden]
+        lm_head,
+        k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-k log-probs and token ids over the LM head. TP=1, no added vocab.
+
+        Returns (sorted_logprobs [N, k] float32, sorted_token_ids [N, k] int64).
+        The `__init__` path rejects tp_size > 1 in best_first mode, so this
+        helper is intentionally simple (no TP gather, no chunking — N is at most
+        `bs * (block_size - 1)` which fits a single matmul).
+        """
+        if hidden_states.numel() == 0:
+            empty_lp = torch.empty(
+                (0, k), dtype=torch.float32, device=hidden_states.device
+            )
+            empty_id = torch.empty(
+                (0, k), dtype=torch.int64, device=hidden_states.device
+            )
+            return empty_lp, empty_id
+
+        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            raise RuntimeError(
+                "DFLASH top-k sampling requires a vocab-parallel head with "
+                "`weight` and `shard_indices`."
+            )
+
+        shard = lm_head.shard_indices
+        if int(shard.num_added_elements) > 0:
+            raise NotImplementedError(
+                "DFLASH best_first does not yet handle vocab heads with added tokens."
+            )
+
+        weight = lm_head.weight
+        num_org = int(shard.num_org_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+
+        hs = (
+            hidden_states
+            if hidden_states.dtype == weight.dtype
+            else hidden_states.to(weight.dtype)
+        )
+        # [N, num_org] in weight dtype. Rank the raw logits directly instead of
+        # materializing a full-vocab float32 log_softmax: log_softmax is a
+        # monotone shift by a per-row constant, so it cannot change the top-k or
+        # its order. Only the k retained values need the normalizer, which the
+        # float32 logsumexp below supplies at the same precision the log_softmax
+        # gave (`logits` is already the bf16 matmul output either way).
+        logits = torch.matmul(hs, weight[:num_org].T)
+        k_eff = min(int(k), num_org)
+        topk_vals, sorted_local_ids = torch.topk(logits, k=k_eff, dim=-1, sorted=True)
+        lse = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
+        sorted_lp = topk_vals.float() - lse
+        sorted_ids = sorted_local_ids.to(torch.int64) + org_vocab_start
+        return sorted_lp, sorted_ids
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1174,7 +1919,9 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
+        t_prep = self._bd_tic()
         self._prepare_for_speculative_decoding(batch, draft_input)
+        self._bd_toc("prepare", t_prep)
 
         assert batch.forward_mode.is_target_verify()
         verify_input = batch.spec_info
@@ -1187,6 +1934,10 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
+        # Time the verify forward only during the startup calibration sweep
+        # (`_sweep_tic`/`_sweep_toc` are no-ops during serving).
+        t_verify = self._sweep_tic()
+        t_vf = self._bd_tic()
         batch_result = self.target_worker.forward_batch_generation(
             batch, is_verify=True, **kwargs
         )
@@ -1194,7 +1945,10 @@ class DFlashWorker:
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
+        self._sweep_toc("verify_s", t_verify)
+        self._bd_toc("verify_fwd", t_vf)
 
+        t_vc = self._bd_tic()
         (
             new_bonus_tokens,
             commit_lens,
@@ -1205,6 +1959,7 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+        self._bd_toc("verify_commit", t_vc)
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1215,14 +1970,21 @@ class DFlashWorker:
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
+        t_du = self._bd_tic()
         draft_input.bonus_tokens = new_bonus_tokens
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
         self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
+        self._bd_toc("draft_update", t_du)
 
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
+        if self._latency_bd and num_correct_drafts_per_req_cpu:
+            self._bd_flush(
+                bs=len(num_correct_drafts_per_req_cpu),
+                al=num_correct_drafts / len(num_correct_drafts_per_req_cpu) + 1.0,
+            )
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
                 "DFLASH verify completed. num_correct_drafts_per_req=%s",

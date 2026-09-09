@@ -229,6 +229,139 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
         )
 
+    if server_args.speculative_dflash_best_first_tokens is not None:
+        verify_length = int(server_args.speculative_dflash_best_first_tokens)
+        if verify_length < 1:
+            raise ValueError(
+                "--speculative-dflash-best-first-tokens must be >= 1, "
+                f"got {verify_length}."
+            )
+        tree_method = getattr(
+            server_args, "speculative_dflash_tree_method", "best_first"
+        )
+        if tree_method not in ("best_first", "beam_search"):
+            raise ValueError(
+                "--speculative-dflash-tree-method must be 'best_first' or "
+                f"'beam_search', got {tree_method!r}."
+            )
+        beam_width = getattr(server_args, "speculative_dflash_beam_width", None)
+        block_size = int(server_args.speculative_num_draft_tokens)
+        if tree_method == "beam_search":
+            if server_args.speculative_dflash_adaptive_tree:
+                raise ValueError(
+                    "--speculative-dflash-tree-method=beam_search is not compatible "
+                    "with --speculative-dflash-adaptive-tree (best_first only)."
+                )
+            if beam_width is None or int(beam_width) < 1:
+                raise ValueError(
+                    "--speculative-dflash-tree-method=beam_search requires "
+                    f"--speculative-dflash-beam-width >= 1, got {beam_width}."
+                )
+            # beam_search size comes from width * depth, not --best-first-tokens.
+            # depth defaults to full (block_size - 1) but can be capped by
+            # --speculative-dflash-beam-max-depth. Recompute so the checks below
+            # see the real node count.
+            full_depth = max(0, block_size - 1)
+            user_depth = getattr(
+                server_args, "speculative_dflash_beam_max_depth", None
+            )
+            beam_depth = (
+                full_depth
+                if user_depth is None
+                else max(1, min(int(user_depth), full_depth))
+            )
+            verify_length = 1 + int(beam_width) * beam_depth
+            logger.info(
+                "DFLASH beam_search: width=%d, depth=%d -> verify_length=%d nodes.",
+                int(beam_width),
+                beam_depth,
+                verify_length,
+            )
+        elif beam_width is not None:
+            logger.warning(
+                "--speculative-dflash-beam-width is ignored unless "
+                "--speculative-dflash-tree-method=beam_search."
+            )
+        # best_first picks the rank-0 chain from each depth + siblings;
+        # so the tree spans at most `block_size` depths. verify_length
+        # itself isn't constrained by block_size — we just need enough
+        # depth + per-depth k for the heap to find verify_length nodes.
+        if verify_length > block_size * block_size:
+            logger.warning(
+                "best_first verify_length=%d is much larger than "
+                "block_size=%d squared; heap will be wide but trees may "
+                "still build correctly.",
+                verify_length,
+                block_size,
+            )
+        # best_first verify is graph-captured through the same tree buffers EAGLE
+        # uses, but those are sized from speculative_num_draft_tokens. A tree of a
+        # different width would overflow (or under-fill) them, so only the matched
+        # case can be captured.
+        if (
+            not server_args.disable_cuda_graph
+            and verify_length != server_args.speculative_num_draft_tokens
+        ):
+            server_args.disable_cuda_graph = True
+            logger.warning(
+                "CUDA graph is disabled because DFLASH best_first verify_length=%d "
+                "does not match speculative_num_draft_tokens=%d; the captured tree "
+                "metadata buffers are sized for the latter. Set them equal to keep "
+                "CUDA graphs.",
+                verify_length,
+                server_args.speculative_num_draft_tokens,
+            )
+        # triton consumes the dense custom_mask directly; fa3/fa4 consume
+        # the same mask via the page-table-rearrangement path in
+        # FlashAttentionBackend (verify-side, see flashattention_backend.py).
+        # flashinfer's custom-mask tree path is not wired yet.
+        best_first_allowed_backends = ("triton", "fa3", "fa4")
+        if (
+            server_args.attention_backend is not None
+            and server_args.attention_backend not in best_first_allowed_backends
+        ):
+            raise ValueError(
+                "DFLASH best_first requires --attention-backend in "
+                f"{best_first_allowed_backends}; got "
+                f"--attention-backend={server_args.attention_backend}."
+            )
+        if server_args.attention_backend is None:
+            server_args.attention_backend = "triton"
+
+        if server_args.speculative_dflash_adaptive_tree:
+            # The adaptive controller varies the verify budget N* every step, so
+            # a captured tree graph would never match. Force eager verify.
+            if not server_args.disable_cuda_graph:
+                server_args.disable_cuda_graph = True
+                logger.warning(
+                    "CUDA graph is disabled because DFLASH adaptive tree mode "
+                    "varies the verify budget N* every step."
+                )
+            min_tokens = server_args.speculative_dflash_tree_min_tokens
+            if min_tokens is not None:
+                if int(min_tokens) < 1:
+                    raise ValueError(
+                        "--speculative-dflash-tree-min-tokens must be >= 1, got "
+                        f"{min_tokens}."
+                    )
+                if int(min_tokens) > verify_length:
+                    raise ValueError(
+                        "--speculative-dflash-tree-min-tokens "
+                        f"({min_tokens}) must be <= "
+                        f"--speculative-dflash-best-first-tokens (N_max={verify_length})."
+                    )
+            logger.info(
+                "DFLASH adaptive tree enabled: N_max=%d, min_tokens=%s. The verify "
+                "cost model is calibrated by a synthetic startup sweep, then frozen.",
+                verify_length,
+                min_tokens if min_tokens is not None else 1,
+            )
+    elif server_args.speculative_dflash_adaptive_tree:
+        raise ValueError(
+            "--speculative-dflash-adaptive-tree requires "
+            "--speculative-dflash-best-first-tokens (the budget upper bound N_max)."
+        )
+
 
 def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
     if server_args.max_running_requests is None:
